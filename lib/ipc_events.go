@@ -86,6 +86,7 @@ func RegisterIPCEvents(w webview.WebView) {
 	})
 
 	type Form struct {
+		Algorithm    string `json:"algorithm"` // "randomx" (xmrig→unMineable) | future: "verushash"
 		Symbol       string `json:"symbol"`
 		Address      string `json:"address"`
 		ReferralCode string `json:"referralCode"`
@@ -103,22 +104,37 @@ func RegisterIPCEvents(w webview.WebView) {
 			return
 		}
 
-		refCode := strings.TrimSpace(form.ReferralCode)
-		if refCode == "" {
-			refCode = defaultReferralCode
+		// Algorithm dispatch. Today only RandomX is implemented.
+		// VerusHash is a planned phase 1-5 deliverable (see /verusminer).
+		algo := strings.ToLower(strings.TrimSpace(form.Algorithm))
+		if algo == "" {
+			algo = "randomx" // backward compat with older UI builds
 		}
 
-		process, err := RunCommand(
-			fmt.Sprintf(`%s --no-color --url=rx.unmineable.com:3333 --algo=rx --pass=x --keepalive --user=%s:%s.UnminerMac#%s --cpu-max-threads-hint=%s`, minerPath, form.Symbol, form.Address, refCode, fmt.Sprint(form.CPUUsage)),
-		)
-		if err != nil {
-			w.Eval(fmt.Sprintf(`onMiningStartedError("%s")`, err))
-			return
+		switch algo {
+		case "randomx":
+			refCode := strings.TrimSpace(form.ReferralCode)
+			if refCode == "" {
+				refCode = defaultReferralCode
+			}
+			process, err := RunCommand(
+				fmt.Sprintf(`%s --no-color --url=rx.unmineable.com:3333 --algo=rx --pass=x --keepalive --user=%s:%s.UnminerMac#%s --cpu-max-threads-hint=%s`, minerPath, form.Symbol, form.Address, refCode, fmt.Sprint(form.CPUUsage)),
+			)
+			if err != nil {
+				w.Eval(fmt.Sprintf(`onMiningStartedError("%s")`, err))
+				return
+			}
+			w.Eval("onMiningStarted()")
+			miningProcess = process
+
+		case "verushash":
+			// Placeholder — phase 1-5 will land a real implementation.
+			// Until then, refuse cleanly so the UI can show a sensible message.
+			w.Eval(`onMiningStartedError("VerusHash backend is in development. Tracking in /verusminer/ — see research page on the website for the roadmap.")`)
+
+		default:
+			w.Eval(fmt.Sprintf(`onMiningStartedError("Unknown algorithm: %s")`, algo))
 		}
-
-		w.Eval("onMiningStarted()")
-
-		miningProcess = process
 	})
 
 	w.Bind("emitStopMining", func() {

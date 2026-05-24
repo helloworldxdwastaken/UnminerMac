@@ -1,6 +1,7 @@
 import { writable } from '@svelte-use/shared'
 
 export const form = writable({
+  algorithm: 'randomx', // 'randomx' (working) | 'verushash' (in development)
   symbol: '',
   address: '',
   referralCode: '',

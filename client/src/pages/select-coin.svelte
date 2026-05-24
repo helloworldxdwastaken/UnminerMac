@@ -152,6 +152,9 @@
       formEl.elements.address.value = stored.address || ''
       formEl.elements.referralCode.value = stored.referralCode || ''
       selectedSymbol = stored.symbol || ''
+      if (stored.algorithm && formEl.elements.algorithm) {
+        formEl.elements.algorithm.value = stored.algorithm
+      }
     }
   })
 </script>
@@ -161,6 +164,32 @@
 </div>
 
 <form bind:this={formEl} on:submit={onStart}>
+  <label class="block my-4">
+    <span class="block text-sm mb-1">Algorithm</span>
+    <select
+      name="algorithm"
+      class="glass-input glass-select w-full px-3 py-2 text-black dark:text-white"
+    >
+      <option value="randomx">RandomX (XMR via unMineable) — working</option>
+      <option value="verushash" disabled
+        >VerusHash 2.2 (Metal) — in development</option
+      >
+    </select>
+    <p class="mt-1 text-xs text-gray-500">
+      Pick which mining algorithm to run. Metal-accelerated VerusHash is
+      a phase-1-to-5 project — see the
+      <a
+        href="#"
+        class="underline hover:text-sky-400"
+        on:click|preventDefault={() =>
+          ipc.send(
+            'emitOpenURL',
+            'https://helloworldxdwastaken.github.io/UnminerMac/research.html',
+          )}>research page</a
+      > for the roadmap.
+    </p>
+  </label>
+
   <label class="block my-4">
     <span class="block text-sm mb-1">
       Select a coin or token
