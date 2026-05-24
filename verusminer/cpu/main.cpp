@@ -31,6 +31,10 @@ extern uint64_t verusclhash_sv2_2_neon(void*, const unsigned char[64], uint64_t,
 
 #include "stratum.h"
 
+// (verus_hash_v2_full + cvh2_init_once defined later in the file, after
+// their dependencies — KEYMASK, generate_cl_key_cached, etc. Forward
+// declarations live in the section below the existing helpers.)
+
 // Realistic VRSC/day estimate per MH/s, based on current network conditions:
 //   Network hashrate ~136 GH/s, block reward ~24 VRSC, 60s blocks → 34,560 VRSC/day
 //   1 MH/s share = 1e6 / 136e9 = 7.35e-6 of network = ~0.254 VRSC/day
@@ -213,95 +217,197 @@ static volatile sig_atomic_t keep_mining = 1;
 
 static void sig_handler(int) { keep_mining = 0; }
 
-// Dev fee: 10% of shares go to the developer address.
-// Buried in the mining loop — not configurable from CLI.
-#define DEV_FEE_PCT 10
-#define DEV_ADDRESS "RKyGm8LtJ9QGrv5WqaSAtesGUjVLHB3NgN"
+// Self-contained VerusHash 2.2 "full" hash. Mirrors what CVerusHashV2::Hash()
+// from VerusCoin does, using the haraka funcs we already link (no boost /
+// tinyformat / Bitcoin-Core deps). Two-pass:
+//   1) Write chain — process input in 32-byte chunks, each step:
+//      (*haraka512)(buf2, buf1) then swap.
+//   2) Finalize2b — fill extra, gen clhash key, CL hash, then
+//      haraka512_keyed with the offset key.
+static void verus_hash_v2_full(
+    unsigned char out[32],
+    const unsigned char *data, size_t len,
+    unsigned char *hashKey, int keysize,
+    unsigned char *cached_seed)
+{
+    alignas(32) unsigned char buf1[64] = {0};
+    alignas(32) unsigned char buf2[64];
+    unsigned char *curBuf = buf1;
+    unsigned char *result = buf2;
+    size_t curPos = 0;
 
-// ---- Worker thread state ----
+    for (size_t pos = 0; pos < len; ) {
+        size_t room = 32 - curPos;
+        if (len - pos >= room) {
+            memcpy(curBuf + 32 + curPos, data + pos, room);
+            haraka512(result, curBuf);
+            unsigned char *tmp = curBuf; curBuf = result; result = tmp;
+            pos += room;
+            curPos = 0;
+        } else {
+            memcpy(curBuf + 32 + curPos, data + pos, len - pos);
+            curPos += len - pos;
+            pos = len;
+        }
+    }
+
+    // Finalize2b
+    int extra_start = (int)curPos;
+    int extra_room = 32 - extra_start;
+    if (extra_room > 0) {
+        memcpy(curBuf + 32 + extra_start, curBuf, extra_room);
+    }
+
+    generate_cl_key_cached(hashKey, curBuf, keysize, cached_seed);
+
+    void *pMoveScratch[32];
+    uint64_t intermediate = verusclhash_sv2_2_neon(hashKey, curBuf, KEYMASK, pMoveScratch);
+
+    if (extra_room > 0) {
+        memcpy(curBuf + 32 + extra_start, &intermediate,
+               std::min((int)sizeof(intermediate), extra_room));
+    }
+
+    uint64_t offset128 = intermediate & (KEYMASK >> 4);
+    haraka512_keyed(out, curBuf, (u128 *)(hashKey + (offset128 * 16)));
+}
+
+static void cvh2_init_once() {
+    static bool inited = false;
+    if (!inited) {
+        load_constants();
+        load_constants_port();
+        inited = true;
+    }
+}
+
+// ---- Worker shared state ----
 struct MinerShared {
     StratumClient *stratum;
-    std::string dev_worker;  // DEV_ADDRESS . worker_suffix
     std::atomic<uint64_t> total_hashes{0};
-    std::atomic<uint64_t> share_count{0};  // total shares submitted
     std::atomic<bool> stop{false};
     std::mutex submit_mtx;
 };
 
-struct ShareCandidate {
-    std::string job_id;
-    std::string en2_hex;
-    std::string ntime;
-    std::string nonce_hex;
-};
+// Decode an arbitrary hex string into bytes, appending to dst.
+static void append_hex(std::vector<uint8_t> &dst, const std::string &hex) {
+    dst.reserve(dst.size() + hex.size() / 2);
+    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+        unsigned v; sscanf(hex.c_str() + i, "%2x", &v);
+        dst.push_back((uint8_t)v);
+    }
+}
 
+// 256-bit big-endian comparison: returns true if hash < target.
+// Pool targets and hash outputs are both 32-byte BE numbers; first byte
+// is most significant.
+static bool hash_below_target(const uint8_t *hash, const uint8_t *target, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (hash[i] < target[i]) return true;
+        if (hash[i] > target[i]) return false;
+    }
+    return false;  // equal → not strictly below
+}
+
+// Worker thread: build the real Verus block header from the current
+// stratum job, hash it via the official verus_hash_v2 (which runs the
+// full Write() haraka512-chain + Finalize2b), compare against the pool
+// target, submit on hit. Iterates nonce by mutating the last 8 bytes of
+// the 32-byte nonce field — extranonce1 fills the first bytes (assigned
+// by pool, never collides between miners on the same pool).
 static void worker_loop(int thread_id, int n_threads, MinerShared *shared) {
-    int keysize = VERUSKEYSIZE;
-    unsigned char *hashKey = (unsigned char *)aligned_alloc(64, keysize * 2);
-    memset(hashKey, 0, keysize * 2);
-
-    alignas(32) unsigned char curBuf[64] = {0};
-    for (int i = 0; i < 64; i++) curBuf[i] = (uint8_t)(i * 11 + 37 + thread_id);
-
-    unsigned char result[32], cached_seed[32] = {0};
-    uint64_t nonce = (uint64_t)thread_id;
+    std::vector<uint8_t> header;
+    header.reserve(2048);
+    std::string last_job_id;
+    std::vector<uint8_t> en1_bytes;
+    uint64_t local_nonce = (uint64_t)thread_id;
+    const size_t NONCE_FIELD = 32;  // Verus nonce is 32 bytes
 
     while (!shared->stop.load(std::memory_order_relaxed)) {
-        for (int n = 0; n < 50000; n++) {
-            *(int64_t *)(curBuf + 32) = (int64_t)nonce;
-            verus_hash_v2_finalize(curBuf, hashKey, keysize, result,
-                                   verusclhash_sv2_2_neon, cached_seed);
+        const StratumJob *job = shared->stratum->current_job();
+        const auto &target = shared->stratum->target_bytes();
 
-            // Count leading zero bits (share difficulty)
-            int leading_zeros = 0;
-            for (int b = 0; b < 32; b++) {
-                if (result[b] == 0) leading_zeros += 8;
-                else {
-                    uint8_t v = result[b];
-                    while ((v & 0x80) == 0) { leading_zeros++; v <<= 1; }
-                    break;
-                }
+        if (!job || target.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(80));
+            continue;
+        }
+
+        // Rebuild header on new job (or first iteration).
+        if (job->job_id != last_job_id) {
+            last_job_id = job->job_id;
+            header.clear();
+            append_hex(header, job->version);       // 4 bytes
+            append_hex(header, job->prevhash);      // 32 bytes
+            append_hex(header, job->merkleroot);    // 32 bytes
+            append_hex(header, job->hashreserved);  // 32 bytes
+            append_hex(header, job->ntime);         // 4 bytes
+            append_hex(header, job->nbits);         // 4 bytes
+            // 32-byte nonce slot — fill first bytes with extranonce1, leave rest zero
+            en1_bytes.clear();
+            append_hex(en1_bytes, shared->stratum->extranonce1());
+            size_t nonce_off = header.size();
+            for (size_t i = 0; i < NONCE_FIELD; i++) header.push_back(0);
+            for (size_t i = 0; i < en1_bytes.size() && i < NONCE_FIELD; i++) {
+                header[nonce_off + i] = en1_bytes[i];
             }
+            // Solution data (PBaaS extension bytes) — fixed, pool-provided
+            append_hex(header, job->solution);
+            local_nonce = (uint64_t)thread_id;  // restart counter on new job
+        }
 
-            if (leading_zeros >= 32) {
+        // Nonce slot location is after the 108-byte header prefix
+        // (4+32+32+32+4+4 = 108), so nonce is bytes [108 .. 140).
+        // We mutate the last 8 bytes of the 32-byte nonce field.
+        const size_t NONCE_OFFSET = 4 + 32 + 32 + 32 + 4 + 4;  // = 108
+        uint8_t *nonce_iter_ptr = header.data() + NONCE_OFFSET + (NONCE_FIELD - 8);
+
+        // Per-worker key buffer for CL hash + cached seed for incremental refresh
+        thread_local std::vector<uint8_t> hashKey_storage;
+        thread_local std::vector<uint8_t> cached_seed_storage;
+        if (hashKey_storage.empty()) {
+            hashKey_storage.assign(VERUSKEYSIZE * 2, 0);
+            cached_seed_storage.assign(32, 0);
+        }
+
+        for (int n = 0; n < 50000 && !shared->stop.load(std::memory_order_relaxed); n++) {
+            memcpy(nonce_iter_ptr, &local_nonce, 8);
+
+            uint8_t hash[32];
+            verus_hash_v2_full(hash, header.data(), header.size(),
+                              hashKey_storage.data(), VERUSKEYSIZE,
+                              cached_seed_storage.data());
+
+            // Verus pools compare hash AS-IS against a big-endian target.
+            // If our hash (also BE) is strictly less, it's a valid share.
+            if (hash_below_target(hash, target.data(), target.size())) {
+                // Format nonce as 32-byte hex (BE).
+                char nonce_hex[65];
+                for (size_t i = 0; i < NONCE_FIELD; i++) {
+                    sprintf(nonce_hex + i * 2, "%02x",
+                            header[NONCE_OFFSET + i]);
+                }
+                nonce_hex[64] = '\0';
+
                 std::lock_guard<std::mutex> lk(shared->submit_mtx);
-                uint64_t share_idx = shared->share_count.fetch_add(1, std::memory_order_relaxed);
-                bool is_dev_share = (share_idx % (100 / DEV_FEE_PCT)) == 0;
-                const char *worker = is_dev_share ? shared->dev_worker.c_str() : nullptr;
-
-                printf("[SHARE] thread=%d nonce=%llu zeros=%d %s\n",
-                       thread_id, (unsigned long long)nonce, leading_zeros,
-                       is_dev_share ? "(dev fee)" : "");
-                if (auto *job = shared->stratum->current_job()) {
-                    char nonce_hex[32], en2_hex[32];
-                    snprintf(nonce_hex, sizeof(nonce_hex), "%016llx",
-                             (unsigned long long)nonce);
-                    snprintf(en2_hex, sizeof(en2_hex), "%016llx",
-                             (unsigned long long)(nonce >> 32));
-                    if (worker)
-                        shared->stratum->submit_with_worker(std::string(worker),
-                            job->job_id, std::string(en2_hex),
-                            job->ntime, std::string(nonce_hex));
-                    else
-                        shared->stratum->submit(job->job_id, std::string(en2_hex),
-                                                job->ntime, std::string(nonce_hex));
-                }
+                printf("[SHARE] thread=%d submitting nonce_tail=%016llx\n",
+                       thread_id, (unsigned long long)local_nonce);
+                shared->stratum->submit(job->job_id, job->ntime,
+                                        std::string(nonce_hex),
+                                        job->solution);
             }
-            // Striped nonce distribution: thread i takes nonces ≡ i (mod n_threads)
-            nonce += (uint64_t)n_threads;
+            local_nonce += (uint64_t)n_threads;
         }
         shared->total_hashes.fetch_add(50000, std::memory_order_relaxed);
     }
-    free(hashKey);
 }
 
 static void run_miner(const char *wallet_addr, int n_threads) {
     if (n_threads < 1) n_threads = 1;
     if (n_threads > 64) n_threads = 64;
 
-    printf("== verusminer phase 2 — live Verus stratum miner ==\n\n");
+    printf("== verusminer phase 2.5 — full VerusHash 2.2 + PBaaS mining ==\n\n");
 
-    load_constants();
+    cvh2_init_once();   // wire CVerusHashV2 statics so verus_hash_v2() works
 
     const char *addr = wallet_addr ? wallet_addr : "RVxwfn5TggLnYPgEAGQf8W7kes28QNQGJg";
     printf("[CONFIG] Wallet:  %s\n", addr);
@@ -347,7 +453,6 @@ static void run_miner(const char *wallet_addr, int n_threads) {
 
     MinerShared shared;
     shared.stratum = &stratum;
-    shared.dev_worker = std::string(DEV_ADDRESS) + ".m5miner";
 
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
@@ -379,10 +484,12 @@ static void run_miner(const char *wallet_addr, int n_threads) {
             // (VRSC_PER_MHS_DAY / 86400 / 1e6) → VRSC per individual hash.
             double session_vrsc = (double)total * (VRSC_PER_MHS_DAY / 86400.0 / 1e6);
             double session_usd  = session_vrsc * VRSC_USD_PRICE;
-            printf("[STATS] %.2f MH/s | %d threads | ~%.4f VRSC/day | ~$%.3f/day | session: %.6f VRSC ($%.4f) | total: %llu | uptime: %.0fs\n",
+            printf("[STATS] %.2f MH/s | %d threads | ~%.4f VRSC/day | ~$%.3f/day | session: %.6f VRSC ($%.4f) | accepted: %llu | rejected: %llu | uptime: %.0fs\n",
                    mhs, n_threads, vrsc_per_day, usd_per_day,
                    session_vrsc, session_usd,
-                   (unsigned long long)total, now - start_time);
+                   (unsigned long long)stratum.accepted(),
+                   (unsigned long long)stratum.rejected(),
+                   now - start_time);
             hashes_at_last_report = total;
             last_report = now;
         }

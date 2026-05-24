@@ -1,6 +1,7 @@
 // stratum.cpp — Verus stratum v1 client implementation
 
 #include "stratum.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -75,20 +76,20 @@ void StratumClient::authorize() {
     send(buf);
 }
 
-void StratumClient::submit(const std::string &job_id, const std::string &extranonce2,
-                           const std::string &ntime, const std::string &nonce_hex) {
-    submit_with_worker(cfg.worker, job_id, extranonce2, ntime, nonce_hex);
-}
-
-void StratumClient::submit_with_worker(const std::string &worker,
-                           const std::string &job_id, const std::string &extranonce2,
-                           const std::string &ntime, const std::string &nonce_hex) {
-    char buf[1024];
-    snprintf(buf, sizeof(buf),
+// Verus mining.submit params: [worker, job_id, ntime, nonce, solution]
+// (matches LuckPool/hellminer reference — 5 params, no extranonce2, but
+// includes the full solution hex since PBaaS embeds extensions in it).
+void StratumClient::submit(const std::string &job_id, const std::string &ntime,
+                           const std::string &nonce_hex, const std::string &solution_hex) {
+    char *buf = (char *)malloc(solution_hex.size() + cfg.worker.size() + 512);
+    int submit_id = msg_id++;
+    pending_submits.push_back(submit_id);
+    sprintf(buf,
         "{\"id\":%d,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}\n",
-        msg_id++, worker.c_str(), job_id.c_str(),
-        extranonce2.c_str(), ntime.c_str(), nonce_hex.c_str());
+        submit_id, cfg.worker.c_str(), job_id.c_str(),
+        ntime.c_str(), nonce_hex.c_str(), solution_hex.c_str());
     send(buf);
+    free(buf);
 }
 
 // ---- Message receive + dispatch ----
@@ -120,54 +121,31 @@ void StratumClient::process_line(const std::string &line) {
     std::string method = json_get_string(line, "\"method\"");
     if (!method.empty()) {
         if (method == "mining.notify") {
-            // Parse notify params
-            job.job_id        = json_get_string(line, "\"params\"");
-            job.version       = json_get_string(line, "\"params\"");
-            job.prevhash      = json_get_string(line, "\"params\"");
-            // Skip coinbase1/coinbase2, they come after merkle branches in some formats
-            // Try to extract from the raw line
-            {
-                auto arr = json_get_array(line, "\"params\"");
-                if (arr.size() >= 10) {
-                    job.job_id   = arr[0];
-                    job.version  = arr[1];
-                    job.prevhash = arr[2];
-                    // arr[3] = transactions (array of hex strings)
-                    job.coinbase1 = arr[4];
-                    job.coinbase2 = arr[5];
-                    // arr[6] = merkle branches (JSON array)
-                    job.ntime    = arr[8];
-                    job.nbits    = arr[9];
-                    job.clean_jobs = (arr.size() > 10) && (arr[10] == "true" || arr[10] == "1");
-                }
-                // Extract merkle branches from raw
-                size_t mb_start = line.find("\"params\"");
-                if (mb_start != std::string::npos) {
-                    // Find the 7th element (index 6) in the params array
-                    // Simple approach: find the 6th comma after "params":[
-                    int bracket_depth = 0;
-                    int param_idx = 0;
-                    for (size_t i = line.find("[\"", mb_start); i < line.size(); i++) {
-                        if (line[i] == '[') bracket_depth++;
-                        else if (line[i] == ']') bracket_depth--;
-                        else if (line[i] == ',' && bracket_depth == 0) param_idx++;
-                        // Hard to parse generically without a real parser
-                    }
-                }
+            // Verus mining.notify is 9-field header-direct:
+            // [job_id, version, prevhash, merkleroot, hashreserved (finalsaplingroot),
+            //  ntime, nbits, clean_jobs, solution]
+            auto arr = json_get_array(line, "\"params\"");
+            if (arr.size() >= 9) {
+                job.job_id       = arr[0];
+                job.version      = arr[1];
+                job.prevhash     = arr[2];
+                job.merkleroot   = arr[3];
+                job.hashreserved = arr[4];
+                job.ntime        = arr[5];
+                job.nbits        = arr[6];
+                job.clean_jobs   = (arr[7] == "true" || arr[7] == "1");
+                job.solution     = arr[8];
+                has_job = true;
+                en2_counter = 0;
+                printf("[JOB] id=%s prev=%s... ntime=%s nbits=%s clean=%d sol_len=%zu\n",
+                       job.job_id.c_str(), job.prevhash.substr(0, 16).c_str(),
+                       job.ntime.c_str(), job.nbits.c_str(),
+                       job.clean_jobs ? 1 : 0, job.solution.size() / 2);
+            } else {
+                fprintf(stderr, "[JOB] unexpected param count: %zu (expected 9)\n", arr.size());
             }
-            has_job = true;
-            en2_counter = 0;  // reset extranonce2 on new job
-            printf("[JOB] id=%s prev=%s... ntime=%s nbits=%s clean=%d\n",
-                   job.job_id.c_str(), job.prevhash.substr(0, 16).c_str(),
-                   job.ntime.c_str(), job.nbits.c_str(), job.clean_jobs);
 
         } else if (method == "mining.set_difficulty") {
-            // params: [difficulty]
-            std::string d_str = json_get_string(line, "\"params\"");
-            if (d_str.empty()) {
-                d_str = json_get_string(line, "params");
-            }
-            // Try to parse as number from raw
             size_t dp = line.find("\"params\"");
             if (dp != std::string::npos) {
                 dp = line.find('[', dp);
@@ -175,10 +153,30 @@ void StratumClient::process_line(const std::string &line) {
                     diff = (uint64_t)strtoull(line.c_str() + dp + 1, nullptr, 10);
                 }
             }
-            printf("[DIFF] set to %llu\n", (unsigned long long)diff);
+            printf("[DIFF] %llu\n", (unsigned long long)diff);
+
+        } else if (method == "mining.set_target") {
+            // Verus uses set_target rather than set_difficulty.
+            // params: ["<32-byte target hex>"]
+            auto arr = json_get_array(line, "\"params\"");
+            if (!arr.empty()) {
+                const std::string &th = arr[0];
+                target.clear();
+                target.reserve(th.size() / 2);
+                for (size_t i = 0; i + 1 < th.size(); i += 2) {
+                    unsigned v;
+                    sscanf(th.c_str() + i, "%2x", &v);
+                    target.push_back((uint8_t)v);
+                }
+                printf("[TARGET] %s (%zu bytes)\n",
+                       th.substr(0, 16).c_str(), target.size());
+            }
 
         } else if (method == "mining.set_extranonce") {
-            printf("[ENONCE] extranonce update received\n");
+            auto arr = json_get_array(line, "\"params\"");
+            if (arr.size() >= 1) en1 = arr[0];
+            if (arr.size() >= 2) en2_size = atoi(arr[1].c_str());
+            printf("[ENONCE] en1=%s en2_size=%d\n", en1.c_str(), en2_size);
         }
         return;
     }
@@ -207,18 +205,37 @@ void StratumClient::process_line(const std::string &line) {
                 }
             }
         }
-        // mining.authorize response
+        // mining.authorize or share-accept response: bare "true"
         else if (result == "true") {
-            printf("[AUTH] Authorized!\n");
-            authorized = true;
+            // Find which msg_id this is responding to.
+            int64_t rid = json_get_int(line, "\"id\"");
+            auto it = std::find(pending_submits.begin(), pending_submits.end(), (int)rid);
+            if (it != pending_submits.end()) {
+                pending_submits.erase(it);
+                accepted_count++;
+                printf("[SHARE ✓] accepted (total: %llu)\n",
+                       (unsigned long long)accepted_count);
+            } else {
+                printf("[AUTH] Authorized!\n");
+                authorized = true;
+            }
         }
         return;
     }
 
-    // Check for "error"
+    // Check for "error" — either an actual error or share rejection
     std::string error = json_get_string(line, "\"error\"");
     if (!error.empty() && error != "null") {
-        printf("[ERROR] %s\n", error.c_str());
+        int64_t rid = json_get_int(line, "\"id\"");
+        auto it = std::find(pending_submits.begin(), pending_submits.end(), (int)rid);
+        if (it != pending_submits.end()) {
+            pending_submits.erase(it);
+            rejected_count++;
+            printf("[SHARE ✗] rejected: %s (total rejected: %llu)\n",
+                   error.c_str(), (unsigned long long)rejected_count);
+        } else {
+            printf("[ERROR] %s\n", error.c_str());
+        }
     }
 }
 
