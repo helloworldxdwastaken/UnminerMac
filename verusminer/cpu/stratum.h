@@ -41,6 +41,9 @@ public:
     void authorize();
     void submit(const std::string &job_id, const std::string &extranonce2,
                 const std::string &ntime, const std::string &nonce_hex);
+    void submit_with_worker(const std::string &worker,
+                const std::string &job_id, const std::string &extranonce2,
+                const std::string &ntime, const std::string &nonce_hex);
     bool receive();  // returns true if new data arrived
 
     const StratumJob *current_job() const { return has_job ? &job : nullptr; }
