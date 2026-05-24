@@ -313,7 +313,12 @@ static void verus_hash_v2_full(
     generate_cl_key_cached(hashKey, curBuf, keysize, cached_seed);
 
     void *pMoveScratch[32];
-    uint64_t intermediate = verusclhash_sv2_2_neon(hashKey, curBuf, KEYMASK, pMoveScratch);
+    // Portable variant CL hash — verified bug-equivalent to NEON via live
+    // pool test (both produced identical pool rejections), confirming the
+    // CL hash impl is not the source of the share-rejection bug. Using
+    // portable here because it's the reference path; swap to NEON for
+    // ~10% throughput when share acceptance is fully verified.
+    uint64_t intermediate = verusclhash_sv2_2_port(hashKey, curBuf, KEYMASK, pMoveScratch);
 
     // Second FillExtra: tile &intermediate (8 bytes) across the same window
     {
@@ -623,7 +628,16 @@ static void worker_loop(int thread_id, int n_threads, MinerShared *shared) {
             local_nonce = (uint64_t)thread_id;
         }
 
-        uint8_t *nonce_iter_ptr = hash_buf.data() + NONCE_OFFSET + (NONCE_FIELD - 8);
+        // IMPORTANT: do NOT mutate the header nNonce. The pool's PBaaS
+        // canonicalize builds a preHeader that INCLUDES the nNonce bytes,
+        // computes blake2b("VerusDefaultHash" personalized) over it, and
+        // requires that blake2b to equal `solution[124..156]` — which was
+        // pre-computed by the daemon over its own (constant) nNonce. If we
+        // mutate header nNonce per iteration, blake2b mismatches and
+        // verushash-node returns 0xff..ff → pool rejects as "low difficulty".
+        // Per verus_hash.cpp comment: "nNonce (if nonce changes must update
+        // preHeaderHash in solution)". We keep nNonce = extranonce1 ||
+        // zeros and find hash diversity by mutating the soln tail.
         const EhParams &p = EH_VARIANTS[current_variant];
         int en1n = (int)std::min((size_t)15, en1_bytes.size());
         uint8_t *body_tail_ptr = hash_buf.data() + body_off + (p.body_bytes - 15) + en1n;
@@ -644,7 +658,9 @@ static void worker_loop(int thread_id, int n_threads, MinerShared *shared) {
         std::vector<uint8_t> scratch(hash_buf.size());
 
         for (int n = 0; n < 50000 && !shared->stop.load(std::memory_order_relaxed); n++) {
-            memcpy(nonce_iter_ptr, &local_nonce, 8);
+            // Header nNonce is FROZEN to extranonce1 || zeros — do not
+            // touch hash_buf[NONCE_OFFSET..NONCE_OFFSET+32]. All hash
+            // diversity comes from mutating the soln tail below.
             if (body_tail_room > 0) {
                 memcpy(body_tail_ptr, &local_nonce, body_tail_room);
             }
