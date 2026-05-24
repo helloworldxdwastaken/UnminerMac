@@ -341,6 +341,23 @@ static bool hash_below_target_le(const uint8_t *hash, const uint8_t *target, siz
     return false;
 }
 
+// THE comparison that matches what LuckPool actually does. Verified by
+// fetching `/verus/stats` (BE-target gives expected-time-to-share ~6 min
+// at our hashrate; LE-target gives ~10^60 minutes — impossible). Pool
+// code: `bignum.fromBuffer(headerHash, {endian: 'little', size: 32})` →
+// hash interpreted LE (byte 31 = MSB), and `set_target` sends bytes in
+// BE display order (byte 0 = MSB). So MSB-of-hash lives at hash[31],
+// MSB-of-target lives at target[0]. Comparison walks one from each end.
+static bool hash_below_target_pool(const uint8_t *hash, const uint8_t *target, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        uint8_t h = hash[n - 1 - i];   // hash MSB-first
+        uint8_t t = target[i];          // target MSB-first
+        if (h < t) return true;
+        if (h > t) return false;
+    }
+    return false;  // equal — pool uses strict less-than
+}
+
 // Count leading zero bits of a 32-byte hash, treating byte 0 as MSB.
 static int leading_zero_bits(const uint8_t *h, size_t n) {
     int z = 0;
@@ -595,18 +612,22 @@ static void worker_loop(int thread_id, int n_threads, MinerShared *shared) {
                               hashKey_storage.data(), VERUSKEYSIZE,
                               cached_seed_storage.data());
 
-            // Pool uses LE numeric interpretation for both hash and target
-            // (jobManager.js: bignum.fromBuffer(..., {endian:'little'})).
-            // Keep BE compare as a diagnostic only.
-            bool below_le = hash_below_target_le(hash, target.data(), target.size());
-            bool below_be = hash_below_target_be(hash, target.data(), target.size());
+            // PRIMARY check: pool's processShare interprets the hash as a
+            // little-endian bignum and compares to the target as sent on
+            // the wire (BE display order). The bytes live at opposite
+            // ends of the two 32-byte buffers, so hash_below_target_pool
+            // walks one from the high end and the other from the low end.
+            // Keep _le / _be as belt-and-braces diagnostics.
+            bool below_pool = hash_below_target_pool(hash, target.data(), target.size());
+            bool below_le   = hash_below_target_le(hash, target.data(), target.size());
+            bool below_be   = hash_below_target_be(hash, target.data(), target.size());
 
             // Force-submit mode: if --debug-submit N was given, submit any
             // hash whose LE leading-zero-bits >= N, regardless of target.
             int lz_le = leading_zero_bits_le(hash, 32);
             bool force = (shared->debug_zero_bits > 0 && lz_le >= shared->debug_zero_bits);
 
-            if (below_le || below_be || force) {
+            if (below_pool || force) {
                 // Format the 32-byte header nonce slot as hex
                 char nonce_hex[65];
                 for (size_t i = 0; i < NONCE_FIELD; i++) {
@@ -637,11 +658,12 @@ static void worker_loop(int thread_id, int n_threads, MinerShared *shared) {
 
                 uint64_t lg = shared->debug_logs.fetch_add(1, std::memory_order_relaxed);
                 if (lg < 5) {
-                    printf("[SHARE] thread=%d worker=%s%s reasons=%s%s%s lz_le=%d\n",
+                    printf("[SHARE] thread=%d worker=%s%s reasons=%s%s%s%s lz_le=%d\n",
                            thread_id, worker.c_str(), is_dev ? " (dev fee)" : "",
-                           below_le ? "LE<target " : "",
-                           below_be ? "BE<target " : "",
-                           force    ? "force      " : "",
+                           below_pool ? "POOL<target " : "",
+                           below_le   ? "LE<target "   : "",
+                           below_be   ? "BE<target "   : "",
+                           force      ? "force"        : "",
                            lz_le);
                     hex_print("hash:",   hash, 32);
                     hex_print("target:", target.data(), target.size());
