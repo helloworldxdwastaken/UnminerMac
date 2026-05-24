@@ -5,9 +5,11 @@
   import { recheckConnection } from '../helper/connectionStatus'
 </script>
 
-<div style="padding-top:40px;text-align:center">
-  <h1 style="font-size:32px;font-weight:700;letter-spacing:-0.02em;color:var(--ink)">
-    Unminer<span style="color:var(--accent)">Mac</span>
+<div style="padding-top:32px;text-align:center">
+  <img src="/logo.png" alt="UnminerMac"
+    style="width:72px;height:72px;border-radius:18px;margin:0 auto 16px;display:block;box-shadow:0 10px 36px rgba(184,61,204,0.30), 0 0 0 1px rgba(255,255,255,0.06)"/>
+  <h1 style="font-size:34px;font-weight:700;letter-spacing:-0.02em;color:var(--ink);line-height:1.05">
+    Unminer<span class="text-logo-gradient">Mac</span>
   </h1>
   <p class="text-dim mt-2" style="font-size:15px">
     Mine XMR & VRSC on Apple Silicon

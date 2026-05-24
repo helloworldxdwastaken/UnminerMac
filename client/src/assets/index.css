@@ -11,8 +11,29 @@
   --ink: #e6edf3;
   --ink-dim: #8b949e;
   --ink-muted: #484f58;
-  --accent: #58a6ff;
-  --accent-glow: rgba(88, 166, 255, 0.35);
+
+  /* Logo-derived palette (sampled from the U icon) */
+  --logo-purple: #b83dcc;
+  --logo-pink:   #ff3d6f;
+  --logo-orange: #ff6b35;
+  --logo-gold:   #f5c242;
+  --logo-cyan:   #3dbeff;
+  --logo-blue:   #3d6fff;
+
+  /* Primary accent now leans on the logo's pink (most vibrant) */
+  --accent: #ff3d6f;
+  --accent-glow: rgba(255, 61, 111, 0.32);
+
+  /* Full logo gradient — used for primary CTA + brand mark */
+  --logo-gradient:
+    linear-gradient(135deg,
+      var(--logo-purple) 0%,
+      var(--logo-pink) 25%,
+      var(--logo-orange) 50%,
+      var(--logo-gold) 70%,
+      var(--logo-cyan) 90%,
+      var(--logo-blue) 100%);
+
   --gold: #d4a853;
   --gold-glow: rgba(212, 168, 83, 0.25);
   --red: #f85149;
@@ -31,9 +52,12 @@ body {
   font-family: "Poppins", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
   color: var(--ink);
   background: var(--bg-root);
+  /* Soft tints of the logo palette in the corners, very subtle */
   background-image:
-    radial-gradient(ellipse 80% 50% at 50% -20%, rgba(88, 166, 255, 0.08), transparent),
-    radial-gradient(ellipse 60% 40% at 90% 100%, rgba(212, 168, 83, 0.05), transparent);
+    radial-gradient(ellipse 70% 45% at 0% 0%, rgba(184, 61, 204, 0.10), transparent 60%),
+    radial-gradient(ellipse 70% 45% at 100% 0%, rgba(255, 61, 111, 0.08), transparent 60%),
+    radial-gradient(ellipse 70% 45% at 100% 100%, rgba(61, 111, 255, 0.08), transparent 60%),
+    radial-gradient(ellipse 70% 45% at 0% 100%, rgba(255, 107, 53, 0.06), transparent 60%);
   background-attachment: fixed;
   min-height: 100vh;
   font-size: 14px;
@@ -174,12 +198,20 @@ body {
 .btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .btn-primary {
-  background: linear-gradient(135deg, var(--accent), #3b82f6);
+  background: var(--logo-gradient);
+  background-size: 180% 180%;
+  background-position: 0% 50%;
   color: #fff;
-  box-shadow: 0 2px 8px var(--accent-glow);
+  box-shadow:
+    0 2px 8px rgba(184, 61, 204, 0.30),
+    0 1px 0 rgba(255, 255, 255, 0.18) inset;
+  transition: background-position 0.4s ease, box-shadow var(--transition), transform var(--transition);
 }
 .btn-primary:hover:not(:disabled) {
-  box-shadow: 0 4px 16px var(--accent-glow);
+  background-position: 100% 50%;
+  box-shadow:
+    0 6px 22px rgba(255, 61, 111, 0.42),
+    0 1px 0 rgba(255, 255, 255, 0.25) inset;
   transform: translateY(-1px);
 }
 .btn-primary:active:not(:disabled) { transform: translateY(0); }
@@ -296,6 +328,23 @@ body {
 .status-dot.online { background: var(--green); box-shadow: 0 0 8px rgba(63,185,80,.5); }
 .status-dot.offline { background: var(--red); box-shadow: 0 0 8px rgba(248,81,73,.5); }
 .status-dot.checking { background: var(--gold); box-shadow: 0 0 8px var(--gold-glow); }
+
+/* ---- Gradient text — used for the brand mark + key accents ---- */
+.text-logo-gradient {
+  background: var(--logo-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+}
+
+/* Gradient outline used to highlight selected info-chip / focused card */
+.card-accent {
+  border-color: transparent;
+  background-image: var(--logo-gradient), linear-gradient(var(--bg-card), var(--bg-card));
+  background-origin: border-box;
+  background-clip: border-box, padding-box;
+}
 
 /* ---- Monospace blocks ---- */
 .mono { font-family: "SF Mono", "Menlo", "Monaco", monospace; font-size: 13px; }
