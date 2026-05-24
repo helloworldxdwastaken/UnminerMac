@@ -143,8 +143,19 @@ func RegisterIPCEvents(w webview.WebView) {
 				w.Eval(`onMiningStartedError("Invalid Verus address. Must start with R, i, or zs1.")`)
 				return
 			}
+			// Convert CPU slider % → thread count for verusminer.
+			// CPUUsage is 0-100 (% of total cores). On M5 with 10 cores
+			// the default 40 = 4 P-cores. Minimum 1 thread.
+			totalCores := runtime.NumCPU()
+			threads := (form.CPUUsage * totalCores) / 100
+			if threads < 1 {
+				threads = 1
+			}
+			if threads > totalCores {
+				threads = totalCores
+			}
 			process, err := RunCommand(
-				fmt.Sprintf(`%s mine %s`, verusPath, addr),
+				fmt.Sprintf(`%s mine %s %d`, verusPath, addr, threads),
 			)
 			if err != nil {
 				w.Eval(fmt.Sprintf(`onMiningStartedError("%s")`, err))

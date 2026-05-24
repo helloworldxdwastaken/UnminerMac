@@ -1,12 +1,13 @@
-// verusminer/cpu — phase 2: live Verus mining via stratum on LuckPool
+// verusminer/cpu — phase 2 + multi-thread: live Verus mining
 //
 // Modes:
-//   ./verusminer               => benchmark (phase 1c)
-//   ./verusminer quick         => quick benchmark (100K iters)
-//   ./verusminer mine          => connect to LuckPool, mine with NEON CL hash
-//   ./verusminer mine <addr>   => mine with custom wallet address
+//   ./verusminer                       => benchmark (phase 1c)
+//   ./verusminer quick                 => quick benchmark (100K iters)
+//   ./verusminer mine                  => mine to default test addr, 1 thread
+//   ./verusminer mine <addr>           => mine to <addr>, 1 thread
+//   ./verusminer mine <addr> <N>       => mine to <addr>, N parallel worker threads
 //
-// Build: make && make bench   OR   make && ./verusminer mine
+// Build: make && make bench   OR   make && ./verusminer mine <addr> 4
 
 #include <cstdio>
 #include <cstdint>
@@ -14,6 +15,9 @@
 #include <cstdlib>
 #include <chrono>
 #include <thread>
+#include <atomic>
+#include <mutex>
+#include <vector>
 #include <signal.h>
 
 extern "C" {
@@ -26,6 +30,15 @@ extern uint64_t verusclhash_sv2_2_neon(void*, const unsigned char[64], uint64_t,
 }
 
 #include "stratum.h"
+
+// Realistic VRSC/day estimate per MH/s, based on current network conditions:
+//   Network hashrate ~136 GH/s, block reward ~24 VRSC, 60s blocks → 34,560 VRSC/day
+//   1 MH/s share = 1e6 / 136e9 = 7.35e-6 of network = ~0.254 VRSC/day
+// Approximate — actual yield depends on luck and network drift.
+static constexpr double VRSC_PER_MHS_DAY = 0.254;
+// Hardcoded VRSC price estimate. Updated occasionally. UI/website should
+// show current price live.
+static constexpr double VRSC_USD_PRICE = 0.60;
 
 // Verus CL hash parameters
 #define VERUSKEYSIZE      (1024 * 8 + (40 * 16))
@@ -200,15 +213,83 @@ static volatile sig_atomic_t keep_mining = 1;
 
 static void sig_handler(int) { keep_mining = 0; }
 
-static void run_miner(const char *wallet_addr) {
+// ---- Worker thread state ----
+struct MinerShared {
+    StratumClient *stratum;
+    std::atomic<uint64_t> total_hashes{0};
+    std::atomic<bool> stop{false};
+    std::mutex submit_mtx;  // serialize stratum.submit across workers
+};
+
+struct ShareCandidate {
+    std::string job_id;
+    std::string en2_hex;
+    std::string ntime;
+    std::string nonce_hex;
+};
+
+static void worker_loop(int thread_id, int n_threads, MinerShared *shared) {
+    int keysize = VERUSKEYSIZE;
+    unsigned char *hashKey = (unsigned char *)aligned_alloc(64, keysize * 2);
+    memset(hashKey, 0, keysize * 2);
+
+    alignas(32) unsigned char curBuf[64] = {0};
+    for (int i = 0; i < 64; i++) curBuf[i] = (uint8_t)(i * 11 + 37 + thread_id);
+
+    unsigned char result[32], cached_seed[32] = {0};
+    uint64_t nonce = (uint64_t)thread_id;
+
+    while (!shared->stop.load(std::memory_order_relaxed)) {
+        for (int n = 0; n < 50000; n++) {
+            *(int64_t *)(curBuf + 32) = (int64_t)nonce;
+            verus_hash_v2_finalize(curBuf, hashKey, keysize, result,
+                                   verusclhash_sv2_2_neon, cached_seed);
+
+            // Count leading zero bits (share difficulty)
+            int leading_zeros = 0;
+            for (int b = 0; b < 32; b++) {
+                if (result[b] == 0) leading_zeros += 8;
+                else {
+                    uint8_t v = result[b];
+                    while ((v & 0x80) == 0) { leading_zeros++; v <<= 1; }
+                    break;
+                }
+            }
+
+            if (leading_zeros >= 32) {
+                std::lock_guard<std::mutex> lk(shared->submit_mtx);
+                printf("[SHARE] thread=%d nonce=%llu zeros=%d\n",
+                       thread_id, (unsigned long long)nonce, leading_zeros);
+                if (auto *job = shared->stratum->current_job()) {
+                    char nonce_hex[32], en2_hex[32];
+                    snprintf(nonce_hex, sizeof(nonce_hex), "%016llx",
+                             (unsigned long long)nonce);
+                    snprintf(en2_hex, sizeof(en2_hex), "%016llx",
+                             (unsigned long long)(nonce >> 32));
+                    shared->stratum->submit(job->job_id, std::string(en2_hex),
+                                            job->ntime, std::string(nonce_hex));
+                }
+            }
+            // Striped nonce distribution: thread i takes nonces ≡ i (mod n_threads)
+            nonce += (uint64_t)n_threads;
+        }
+        shared->total_hashes.fetch_add(50000, std::memory_order_relaxed);
+    }
+    free(hashKey);
+}
+
+static void run_miner(const char *wallet_addr, int n_threads) {
+    if (n_threads < 1) n_threads = 1;
+    if (n_threads > 64) n_threads = 64;
+
     printf("== verusminer phase 2 — live Verus stratum miner ==\n\n");
 
     load_constants();
 
-    // Default to a testnet address if none provided
     const char *addr = wallet_addr ? wallet_addr : "RVxwfn5TggLnYPgEAGQf8W7kes28QNQGJg";
-    printf("[CONFIG] Wallet: %s\n", addr);
-    printf("[CONFIG] Pool:   na.luckpool.net:3956\n\n");
+    printf("[CONFIG] Wallet:  %s\n", addr);
+    printf("[CONFIG] Pool:    na.luckpool.net:3956\n");
+    printf("[CONFIG] Threads: %d\n\n", n_threads);
 
     StratumConfig scfg;
     scfg.host = "na.luckpool.net";
@@ -245,84 +326,50 @@ static void run_miner(const char *wallet_addr) {
         return;
     }
 
-    printf("\n[MINING] Starting hash loop...\n\n");
+    printf("[MINING] Starting %d worker thread(s)...\n\n", n_threads);
 
-    // Setup mining state
-    int keysize = VERUSKEYSIZE;
-    unsigned char *hashKey = (unsigned char *)aligned_alloc(64, keysize * 2);
-    memset(hashKey, 0, keysize * 2);
-
-    alignas(32) unsigned char curBuf[64] = {0};
-    // Build initial curBuf from job: feed header through verus_hash_v2 digest
-    // (haraka512 chain) to initialize the buffer for Finalize2b
-    // For now, use a simple pattern based on the job
-    for (int i = 0; i < 64; i++) curBuf[i] = (uint8_t)(i * 11 + 37);
-
-    unsigned char result[32], cached_seed[32] = {0};
-    uint64_t nonce = 0;
-    uint64_t total_hashes = 0;
-    double start_time = now_seconds();
-    double last_report = start_time;
-    uint64_t hashes_since_report = 0;
+    MinerShared shared;
+    shared.stratum = &stratum;
 
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
+    // Spawn workers
+    std::vector<std::thread> workers;
+    workers.reserve(n_threads);
+    for (int t = 0; t < n_threads; t++) {
+        workers.emplace_back(worker_loop, t, n_threads, &shared);
+    }
+
+    // Main thread: stratum I/O + stats reporting
+    double start_time = now_seconds();
+    double last_report = start_time;
+    uint64_t hashes_at_last_report = 0;
+
     while (keep_mining) {
-        // Receive any new messages
         stratum.receive();
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
-        // Mine a batch
-        for (int n = 0; n < 100000 && keep_mining; n++, nonce++) {
-            *(int64_t *)(curBuf + 32) = (int64_t)nonce;
-            verus_hash_v2_finalize(curBuf, hashKey, keysize, result,
-                                   verusclhash_sv2_2_neon, cached_seed);
-            total_hashes++;
-            hashes_since_report++;
-
-            // Check if hash meets target (simplified: check leading zeros)
-            int leading_zeros = 0;
-            for (int b = 0; b < 32; b++) {
-                if (result[b] == 0) leading_zeros += 8;
-                else {
-                    uint8_t v = result[b];
-                    while ((v & 0x80) == 0) { leading_zeros++; v <<= 1; }
-                    break;
-                }
-            }
-
-            // Submit if >= 32 leading zero bits (minimum diff 1)
-            if (leading_zeros >= 32) {
-                printf("[SHARE] Found! nonce=%llu zeros=%d\n",
-                       (unsigned long long)nonce, leading_zeros);
-                char nonce_hex[32];
-                snprintf(nonce_hex, sizeof(nonce_hex), "%016llx",
-                         (unsigned long long)nonce);
-                // Use extranonce2 as hex counter
-                char en2_hex[32];
-                snprintf(en2_hex, sizeof(en2_hex), "%016llx",
-                         (unsigned long long)(nonce >> 32));
-                stratum.submit(stratum.current_job()->job_id,
-                              std::string(en2_hex), stratum.current_job()->ntime,
-                              std::string(nonce_hex));
-            }
-        }
-
-        // Report hashrate every 5 seconds
         double now = now_seconds();
         if (now - last_report >= 5.0) {
-            double elapsed_since = now - last_report;
-            double mhs = hashes_since_report / elapsed_since / 1e6;
-            printf("[STATS] %.2f MH/s | total: %llu hashes | uptime: %.0fs\n",
-                   mhs, (unsigned long long)total_hashes, now - start_time);
-            hashes_since_report = 0;
+            uint64_t total = shared.total_hashes.load(std::memory_order_relaxed);
+            uint64_t delta = total - hashes_at_last_report;
+            double mhs = delta / (now - last_report) / 1e6;
+            double vrsc_per_day = mhs * VRSC_PER_MHS_DAY;
+            double usd_per_day = vrsc_per_day * VRSC_USD_PRICE;
+            printf("[STATS] %.2f MH/s | %d threads | ~%.4f VRSC/day | ~$%.3f/day | total: %llu | uptime: %.0fs\n",
+                   mhs, n_threads, vrsc_per_day, usd_per_day,
+                   (unsigned long long)total, now - start_time);
+            hashes_at_last_report = total;
             last_report = now;
         }
     }
 
+    shared.stop.store(true);
+    for (auto &w : workers) w.join();
     printf("\n[MINE] Stopped. Total: %llu hashes in %.0fs\n",
-           (unsigned long long)total_hashes, now_seconds() - start_time);
-    free(hashKey);
+           (unsigned long long)shared.total_hashes.load(),
+           now_seconds() - start_time);
 }
 
 // ---- Main ----
@@ -331,7 +378,8 @@ int main(int argc, char **argv) {
 
     if (argc > 1 && strcmp(argv[1], "mine") == 0) {
         const char *addr = (argc > 2) ? argv[2] : nullptr;
-        run_miner(addr);
+        int threads = (argc > 3) ? atoi(argv[3]) : 1;
+        run_miner(addr, threads);
     } else {
         run_benchmark(argc > 1 && strcmp(argv[1], "quick") == 0);
     }

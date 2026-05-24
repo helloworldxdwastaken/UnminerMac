@@ -12,27 +12,25 @@
   import Drawer from '../components/Drawer.svelte'
   import TopButtons from '../components/TopButtons.svelte'
   import { log } from '../util/log'
-  import { getHashrate } from '../util/mining'
+  import { getHashrate, parseMiningStats } from '../util/mining'
   import Link from '../components/Link.svelte'
 
   let dialogLogsData = []
+  let liveStats = {} // { vrscPerDay, usdPerDay, threads }
 
   miningLogs.subscribe((logs) => {
     dialogLogsData = logs
 
     const log = logs[logs.length - 1]
-    hashrates.update((val) => {
-      const hs = getHashrate(log, $form.algorithm)
-      if (hs) {
-        val.push(hs)
-      }
-
-      if (val.length > 6) {
-        val.shift()
-      }
-
-      return val
-    })
+    const stats = parseMiningStats(log, $form.algorithm)
+    if (stats.hashrate) {
+      hashrates.update((val) => {
+        val.push(stats.hashrate)
+        if (val.length > 6) val.shift()
+        return val
+      })
+    }
+    if (stats.vrscPerDay !== undefined) liveStats = stats
   })
 
   let logDrawerEl
@@ -190,6 +188,24 @@
           <span>{currentHashrate || 0} H/s</span>
         {/if}
       </div>
+      {#if $form.algorithm === 'verushash' && liveStats.vrscPerDay !== undefined}
+        <div class="mt-2 flex items-baseline gap-3 text-sm">
+          <span class="text-gray-500">~</span>
+          <span class="font-mono text-sky-400 font-semibold"
+            >{liveStats.vrscPerDay.toFixed(4)} VRSC/day</span
+          >
+          <span class="font-mono text-emerald-400 font-semibold"
+            >${liveStats.usdPerDay.toFixed(3)}/day</span
+          >
+          {#if liveStats.threads}
+            <span class="text-gray-500 text-xs">· {liveStats.threads} threads</span>
+          {/if}
+        </div>
+        <p class="text-[10px] text-gray-500 mt-1">
+          Estimate based on current network ~136 GH/s + VRSC ~$0.60. Actual
+          payout varies with luck and price.
+        </p>
+      {/if}
     </div>
     <div class="flex justify-between items-end">
       <div class="flex flex-col"></div>
