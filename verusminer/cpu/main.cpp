@@ -612,6 +612,11 @@ static void worker_loop(int thread_id, int n_threads, MinerShared *shared) {
             append_hex(hash_buf, job->hashreserved);
             append_hex(hash_buf, job->ntime);
             append_hex(hash_buf, job->nbits);
+            // Header nNonce layout: [extranonce1(4) || zeros(20) || worker_nonce(8)]
+            // The extranonce1 prefix is the pool-assigned per-miner ID — it
+            // guarantees that two miners sharing the same job never collide
+            // on the same nonce space. The trailing 8 bytes are mutated
+            // per-iteration in the inner loop for hash diversity.
             for (size_t i = 0; i < NONCE_FIELD; i++) hash_buf.push_back(0);
             for (size_t i = 0; i < en1_bytes.size() && i < NONCE_FIELD; i++) {
                 hash_buf[NONCE_OFFSET + i] = en1_bytes[i];
@@ -652,26 +657,26 @@ static void worker_loop(int thread_id, int n_threads, MinerShared *shared) {
             cached_seed_storage.assign(32, 0);
         }
 
-        // Pre-allocate a per-iteration scratch that mirrors hash_buf so we
-        // can apply the PBaaS canonicalisation without destroying the
-        // canonical bytes we need to keep mutating each loop.
-        std::vector<uint8_t> scratch(hash_buf.size());
+        // hellcatz/verushash-node (the fork LuckPool actually runs — see
+        // https://github.com/hellcatz/verushash-node/blob/master/verushash.cc
+        // verusHashV2b2) does NOT do any PBaaS pre-clear. It just calls
+        // Reset/Write/Finalize2b on the raw buffer. So we hash hash_buf
+        // directly — no scratch copy, no canonicalize. This also means
+        // we CAN mutate the header nNonce per iteration (the daemon's
+        // blake2b match check isn't part of LuckPool's hashing path).
+        uint8_t *nonce_iter_ptr = hash_buf.data() + NONCE_OFFSET + (NONCE_FIELD - 8);
 
         for (int n = 0; n < 50000 && !shared->stop.load(std::memory_order_relaxed); n++) {
-            // Header nNonce is FROZEN to extranonce1 || zeros — do not
-            // touch hash_buf[NONCE_OFFSET..NONCE_OFFSET+32]. All hash
-            // diversity comes from mutating the soln tail below.
+            // Vary BOTH the header nonce tail and the soln body tail per
+            // iteration. Pool hashes the raw bytes, so both contribute to
+            // hash output. Keeping both varied gives better mixing.
+            memcpy(nonce_iter_ptr, &local_nonce, 8);
             if (body_tail_room > 0) {
                 memcpy(body_tail_ptr, &local_nonce, body_tail_room);
             }
 
-            // Copy header+soln, then zero the same regions the pool zeros
-            // before hashing (matches verushash-node vh.hash2b2 exactly).
-            memcpy(scratch.data(), hash_buf.data(), hash_buf.size());
-            pbaas_canonicalize(scratch.data(), scratch.size());
-
             uint8_t hash[32];
-            verus_hash_v2_full(hash, scratch.data(), scratch.size(),
+            verus_hash_v2_full(hash, hash_buf.data(), hash_buf.size(),
                               hashKey_storage.data(), VERUSKEYSIZE,
                               cached_seed_storage.data());
 
@@ -770,7 +775,13 @@ static void run_miner(const char *wallet_addr, int n_threads, int debug_zero_bit
     scfg.host = "na.luckpool.net";
     scfg.port = 3956;
     scfg.worker = user_worker;
-    scfg.password = "x";
+    // Password 'x,d=1' requests the LOWEST allowed share difficulty from
+    // LuckPool (see https://luckpool.net/verus/connect.html — Advanced
+    // Password Parameters → Custom Desired Difficulty d=N). At default
+    // diff (~27 zero bits) one M5 P-core takes ~5 min/share; at d=1 the
+    // target relaxes to ~16 zero bits → ~1 share/sec. This makes share
+    // acceptance verifiable in seconds instead of minutes.
+    scfg.password = "x,d=1";
 
     StratumClient stratum(scfg);
     if (!stratum.connect()) {
