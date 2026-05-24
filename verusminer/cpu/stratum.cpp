@@ -76,17 +76,31 @@ void StratumClient::authorize() {
     send(buf);
 }
 
+void StratumClient::authorize_extra(const std::string &worker, const std::string &password) {
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+        "{\"id\":%d,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"%s\"]}\n",
+        msg_id++, worker.c_str(), password.c_str());
+    send(buf);
+}
+
 // Verus mining.submit params: [worker, job_id, ntime, nonce, solution]
 // (matches LuckPool/hellminer reference — 5 params, no extranonce2, but
 // includes the full solution hex since PBaaS embeds extensions in it).
 void StratumClient::submit(const std::string &job_id, const std::string &ntime,
                            const std::string &nonce_hex, const std::string &solution_hex) {
-    char *buf = (char *)malloc(solution_hex.size() + cfg.worker.size() + 512);
+    submit_with_worker(cfg.worker, job_id, ntime, nonce_hex, solution_hex);
+}
+
+void StratumClient::submit_with_worker(const std::string &worker,
+                                       const std::string &job_id, const std::string &ntime,
+                                       const std::string &nonce_hex, const std::string &solution_hex) {
+    char *buf = (char *)malloc(solution_hex.size() + worker.size() + 512);
     int submit_id = msg_id++;
     pending_submits.push_back(submit_id);
     sprintf(buf,
         "{\"id\":%d,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}\n",
-        submit_id, cfg.worker.c_str(), job_id.c_str(),
+        submit_id, worker.c_str(), job_id.c_str(),
         ntime.c_str(), nonce_hex.c_str(), solution_hex.c_str());
     send(buf);
     free(buf);
@@ -184,26 +198,26 @@ void StratumClient::process_line(const std::string &line) {
     // Check for "result" → response to our request
     std::string result = json_get_string(line, "\"result\"");
     if (!result.empty() && result != "null") {
-        // mining.subscribe response: [["mining.notify","mining.set_difficulty"], "EXTRA1", EXTRA2SIZE]
+        // mining.subscribe response. Two flavors seen in the wild:
+        //   3-element: [["mining.notify",...], "EXTRA1", EXTRA2SIZE]
+        //   2-element: [null, "EXTRA1"]          ← LuckPool sends this form
+        // We just grab the FIRST quoted hex string after the opening '['
+        // — that's extranonce1 in both forms. Then look for any trailing
+        // integer for en2_size (optional, defaults to 8).
         if (result[0] == '[') {
-            // Extract extranonce1 (3rd element in result array)
-            size_t p1 = result.find(',');
-            if (p1 != std::string::npos) {
-                size_t p2 = result.find(',', p1 + 1);
-                if (p2 != std::string::npos) {
-                    size_t q1 = result.find('"', p1 + 1);
-                    size_t q2 = result.find('"', q1 + 1);
-                    if (q1 != std::string::npos && q2 != std::string::npos) {
-                        en1 = result.substr(q1 + 1, q2 - q1 - 1);
-                    }
-                    // extranonce2 size
-                    size_t e2_start = result.find_first_of("0123456789", p2 + 1);
-                    if (e2_start != std::string::npos) {
-                        en2_size = (int)strtol(result.c_str() + e2_start, nullptr, 10);
-                    }
-                    printf("[SUBSCRIBE] extranonce1=%s en2_size=%d\n", en1.c_str(), en2_size);
-                }
+            size_t q1 = result.find('"');
+            size_t q2 = (q1 != std::string::npos) ? result.find('"', q1 + 1)
+                                                  : std::string::npos;
+            if (q1 != std::string::npos && q2 != std::string::npos) {
+                en1 = result.substr(q1 + 1, q2 - q1 - 1);
             }
+            // Optional trailing en2_size after the last quote.
+            size_t after = (q2 != std::string::npos) ? q2 + 1 : 1;
+            size_t e2_start = result.find_first_of("0123456789", after);
+            if (e2_start != std::string::npos) {
+                en2_size = (int)strtol(result.c_str() + e2_start, nullptr, 10);
+            }
+            printf("[SUBSCRIBE] extranonce1=%s en2_size=%d\n", en1.c_str(), en2_size);
         }
         // mining.authorize or share-accept response: bare "true"
         else if (result == "true") {

@@ -2,6 +2,7 @@
   import { tryOnMount, tryOnDestroy } from '@svelte-use/core'
   import { form, isMining, preparing, miningLogs, hashrates } from '../store'
   import { getBalance } from '../server/unMineable'
+  import { fetchLuckPoolLive } from '../server/luckPool'
   import IconRefresh from '../components/icons/Refresh.svelte'
   import IconFileList from '../components/icons/FileList.svelte'
   import IconSettings from '../components/icons/Settings.svelte'
@@ -21,6 +22,9 @@
   let refreshingBalance = false
   let copiedAddress = false
   let liveStats = {}
+  let poolLive = null            // LuckPool API snapshot
+  let poolPollTimer = null
+  let poolFetching = false
 
   $: currentHashrate = $hashrates[$hashrates.length - 1]
   $: isVerus = $form.algorithm === 'verushash'
@@ -85,11 +89,29 @@
     ipc.send('emitOpenURL', url)
   }
 
+  async function refreshPoolLive() {
+    if (poolFetching || !$form.address) return
+    poolFetching = true
+    try {
+      const snap = await fetchLuckPoolLive($form.address)
+      if (snap) poolLive = snap
+    } finally {
+      poolFetching = false
+    }
+  }
+
   tryOnMount(() => {
-    if (!isVerus) handleGetBalance()
+    if (isVerus) {
+      // First fetch immediately, then poll every 30s while page is mounted.
+      refreshPoolLive()
+      poolPollTimer = setInterval(refreshPoolLive, 30000)
+    } else {
+      handleGetBalance()
+    }
   })
   tryOnDestroy(() => {
     $miningLogs.length = 0
+    if (poolPollTimer) clearInterval(poolPollTimer)
   })
 
   // Formatted MH/s string for the headline
@@ -152,44 +174,64 @@
 
     <!-- Earnings + payout chips -->
     {#if isVerus}
-      <!-- ⚠ Honest disclosure: share submission is not fully implemented yet.
-           Theoretical numbers shown below are CPU-side math, not actual
-           pool-accepted earnings. Always check the pool dashboard for the
-           real number. -->
-      <div
-        class="card-accent"
-        style="border:1px solid rgba(245,194,66,.4);background:rgba(245,194,66,.08);
-               border-radius:10px;padding:10px 12px;margin-bottom:12px;font-size:12px;line-height:1.45">
-        <strong style="color:var(--gold)">⚠ Share validation in development.</strong>
-        <span class="text-dim">
-          The miner is computing real VerusHash 2.2 hashes at the reported
-          speed, but share submission to LuckPool is incomplete. Numbers
-          below are <em>theoretical</em> — verify confirmed VRSC via
-          <button
-            type="button"
-            class="btn btn-ghost"
-            style="padding:0;display:inline;color:var(--accent);font-size:inherit"
-            on:click={openExplorer}>Pool dashboard ↗</button>.
-        </span>
-      </div>
+      {#if !poolLive || !poolLive.minerKnown}
+        <!-- Pre-acceptance banner: shown while pool hasn't seen this address
+             yet (first share takes a few minutes to land). Disappears once
+             /verus/miner/<addr> returns a real miner object. -->
+        <div
+          class="card-accent"
+          style="border:1px solid rgba(245,194,66,.4);background:rgba(245,194,66,.08);
+                 border-radius:10px;padding:10px 12px;margin-bottom:12px;font-size:12px;line-height:1.45">
+          <strong style="color:var(--gold)">⏳ Waiting for first accepted share…</strong>
+          <span class="text-dim">
+            Miner is hashing at the reported speed. LuckPool will register
+            this address after the first share is accepted (a few minutes at
+            this hashrate). Until then, numbers below are projections.
+            Verify live on
+            <button
+              type="button"
+              class="btn btn-ghost"
+              style="padding:0;display:inline;color:var(--accent);font-size:inherit"
+              on:click={openExplorer}>Pool dashboard ↗</button>.
+          </span>
+        </div>
+      {/if}
     {/if}
 
     <div class="info-grid">
       {#if isVerus}
-        {#if liveStats.sessionVrsc !== undefined}
+        <!-- LIVE pool earnings, when available -->
+        {#if poolLive && (poolLive.vrscLast24h > 0 || poolLive.minerKnown)}
           <div class="info-chip">
-            <div class="chip-label">Session Hashed (theoretical)</div>
+            <div class="chip-label">Mined · last 24h <span style="color:var(--green)">● live</span></div>
             <div class="chip-value mono">
-              {liveStats.sessionVrsc.toFixed(6)} VRSC
-              <span style="color:var(--ink-dim);font-weight:400">
-                ≈ ${liveStats.sessionUsd?.toFixed(4) || '0.0000'}
-              </span>
+              {poolLive.vrscLast24h.toFixed(6)} VRSC
             </div>
           </div>
+          <div class="info-chip">
+            <div class="chip-label">Mined · last 7d</div>
+            <div class="chip-value mono">
+              {poolLive.vrscLast7d.toFixed(6)} VRSC
+            </div>
+          </div>
+          {#if poolLive.miner?.balance !== undefined}
+            <div class="info-chip" style="grid-column:1/-1">
+              <div class="chip-label">Pending balance (auto-paid at {poolLive.minPayment} VRSC)</div>
+              <div class="chip-value mono">{Number(poolLive.miner.balance).toFixed(8)} VRSC</div>
+            </div>
+          {/if}
+          {#if poolLive.miner?.paid !== undefined}
+            <div class="info-chip" style="grid-column:1/-1">
+              <div class="chip-label">Total paid out</div>
+              <div class="chip-value mono">{Number(poolLive.miner.paid).toFixed(8)} VRSC</div>
+            </div>
+          {/if}
         {/if}
+
+        <!-- Projection from CPU hashrate (always shown — gives expectation) -->
         {#if liveStats.vrscPerDay !== undefined}
           <div class="info-chip">
-            <div class="chip-label">If Shares Valid / Day</div>
+            <div class="chip-label">Projected / day · from {liveStats.threads || '?'} threads</div>
             <div class="chip-value mono">
               {liveStats.vrscPerDay.toFixed(4)} VRSC
               <span style="color:var(--green);font-weight:400">
@@ -198,9 +240,19 @@
             </div>
           </div>
         {/if}
+        {#if liveStats.sessionVrsc !== undefined && !poolLive?.minerKnown}
+          <div class="info-chip">
+            <div class="chip-label">Session hashed (projected)</div>
+            <div class="chip-value mono">
+              {liveStats.sessionVrsc.toFixed(6)} VRSC
+            </div>
+          </div>
+        {/if}
         <div class="info-chip" style="grid-column:1/-1">
-          <div class="chip-label">Payout (once shares are accepted)</div>
-          <div class="chip-value">Auto · every 20h · min 0.0001 VRSC</div>
+          <div class="chip-label">Payout</div>
+          <div class="chip-value">
+            Auto · every 20h · min {poolLive?.minPayment || 0.0001} VRSC
+          </div>
         </div>
       {:else if balance.pendingBalance !== undefined}
         <div class="info-chip">

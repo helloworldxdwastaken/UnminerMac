@@ -46,9 +46,17 @@ public:
     void disconnect();
     void subscribe();
     void authorize();
+    // Authorize an extra worker (used for the dev-fee address — pool supports
+    // multiple authorized workers per session).
+    void authorize_extra(const std::string &worker, const std::string &password);
     // Verus mining.submit: [worker, job_id, ntime, nonce, solution] (5 params)
     void submit(const std::string &job_id, const std::string &ntime,
                 const std::string &nonce_hex, const std::string &solution_hex);
+    // Same as submit() but lets the caller override which authorized worker
+    // gets credited (dev-fee rotation routes to a different worker name).
+    void submit_with_worker(const std::string &worker,
+                            const std::string &job_id, const std::string &ntime,
+                            const std::string &nonce_hex, const std::string &solution_hex);
     bool receive();  // returns true if new data arrived
 
     const StratumJob *current_job() const { return has_job ? &job : nullptr; }
