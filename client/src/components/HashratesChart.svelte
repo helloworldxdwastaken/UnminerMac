@@ -27,7 +27,7 @@
           data1: 'Hashrate',
         },
         colors: {
-          data1: '#0070F3',
+          data1: '#58a6ff',
         },
       },
       transition: {

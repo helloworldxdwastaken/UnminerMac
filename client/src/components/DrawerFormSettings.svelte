@@ -67,7 +67,7 @@
   <button
     slot="footer"
     type="button"
-    class="glass-btn px-4 py-2 ml-4 text-sm"
+    class="btn btn-primary"
     on:click={handleSave}
     disabled={saving || !isChanged}
   >
