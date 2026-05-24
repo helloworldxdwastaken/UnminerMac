@@ -11,7 +11,7 @@
     "update:coins": "node scripts/updateApiCoins.js"
   },
   "dependencies": {
-    "@shoelace-style/shoelace": "^2.0.0-beta.52",
+    "@shoelace-style/shoelace": "^2.0.0-beta.60",
     "@svelte-use/core": "^0.10.1",
     "@svelte-use/shared": "^0.10.1",
     "c3": "^0.7.20",
@@ -22,7 +22,7 @@
   },
   "devDependencies": {
     "@2nthony/prettier-config": "^1.0.0",
-    "@sveltejs/vite-plugin-svelte": "^1.0.0-next.26",
+    "@sveltejs/vite-plugin-svelte": "^1.0.0-next.41",
     "autoprefixer": "^10.3.6",
     "ava": "^3.15.0",
     "bumpp": "^7.1.1",

@@ -12,5 +12,5 @@
   rel="noreferrer noopener"
   target="_blank"
   class={className}
-  on:click={ipc.send('emitOpenURL', url)}><slot /></a
+  on:click={() => ipc.send('emitOpenURL', url)}><slot /></a
 >

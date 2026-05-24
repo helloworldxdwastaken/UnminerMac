@@ -1,13 +1,13 @@
 import { apiv4coin } from './unMineableCoins'
 
-export const apiServer = 'https://api.unminable.com'
+export const apiServer = 'https://api.unmineable.com'
 
-const referralCode = 'xngb-nrye'
+const referralCode = ''
 
 const presetCoins = [
   fastCoin('Ethereum', 'ETH', referralCode),
-  fastCoin('Dogecoin', 'DOGE', '8jjv-jipu'),
-  fastCoin('SHIBA', 'SHIB', 'c310-m2st'),
+  fastCoin('Dogecoin', 'DOGE', referralCode),
+  fastCoin('SHIBA', 'SHIB', referralCode),
 ]
 
 export const unMineableCoins = presetCoins
@@ -26,11 +26,48 @@ export function getReferralCode(coins, symbol) {
   return coins.find((coin) => coin[1] === symbol)[2]
 }
 
-export function validateAddress(symbol, address) {
-  // return Promise.resolve(true)
-  return fetch(`${apiServer}/v4/address/${address}?coin=${symbol}`)
-    .then((res) => res.json())
-    .then((res) => !!res.success)
+export class NetworkError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = 'NetworkError'
+  }
+}
+
+export async function fetchCoinDetail(symbol) {
+  if (!symbol) return null
+  try {
+    const res = await fetch(`${apiServer}/v4/coin/${encodeURIComponent(symbol)}`)
+    if (!res.ok) return null
+    const json = await res.json()
+    if (!json || !json.success || !json.data) return null
+    return json.data
+  } catch (e) {
+    return null
+  }
+}
+
+export async function validateAddress(symbol, address) {
+  let res
+  try {
+    res = await fetch(`${apiServer}/v4/address/${address}?coin=${symbol}`)
+  } catch (e) {
+    throw new NetworkError(
+      `Could not reach unMineable (${e.message}). Turn on Cloudflare WARP / 1.1.1.1 or encrypted DNS, then try again.`,
+    )
+  }
+  const text = await res.text()
+  if (!text.trim().startsWith('{')) {
+    throw new NetworkError(
+      'unMineable returned a non-JSON response (likely a DNS/filter block page). Turn on your VPN and try again.',
+    )
+  }
+  let json
+  try {
+    json = JSON.parse(text)
+  } catch (e) {
+    throw new NetworkError('unMineable returned invalid JSON. Check your network.')
+  }
+  return !!json.success
 }
 
 export function getBalance(symbol, address) {

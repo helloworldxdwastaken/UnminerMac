@@ -128,12 +128,14 @@
             </p>
           </sl-tooltip>
 
-          <sl-button
-            size="small"
-            on:click={ipc.send(
-              'emitOpenURL',
-              `https://unmineable.com/coins/${$form.symbol}/address/${$form.address}`,
-            )}>Stats</sl-button
+          <button
+            type="button"
+            class="glass-btn-ghost px-3 py-1 text-xs"
+            on:click={() =>
+              ipc.send(
+                'emitOpenURL',
+                `https://unmineable.com/coins/${$form.symbol}/address/${$form.address}`,
+              )}>Stats</button
           >
         </div>
       </div>
@@ -182,18 +184,7 @@
       </div>
     </div>
     <div class="flex justify-between items-end">
-      <div class="flex flex-col">
-        <sl-tooltip
-          content="Please considering buy me a coffee, it's important to me 🙏"
-          placement="top"
-        >
-          <Link
-            url="https://2nthony.notion.site/Buy-2nthony-Coffee-d67a508cd58e4896bfb50c7112f93f51"
-            class="text-xs text-gray-500 m-0 underline hover:text-indigo-500"
-            >BuyMeACoffee 🙏</Link
-          >
-        </sl-tooltip>
-      </div>
+      <div class="flex flex-col"></div>
       <div class="flex items-center">
         <sl-tooltip content="Log" placement="top">
           <IconFileList
@@ -202,12 +193,18 @@
           />
         </sl-tooltip>
         {#if !$isMining}
-          <sl-button type="primary" disabled={$preparing} on:click={handleStart}
-            >Start</sl-button
+          <button
+            type="button"
+            class="glass-btn px-5 py-2 text-sm font-medium"
+            disabled={$preparing}
+            on:click={handleStart}>Start</button
           >
         {:else}
-          <sl-button type="danger" disabled={$preparing} on:click={handleStop}
-            >Stop</sl-button
+          <button
+            type="button"
+            class="glass-btn-danger px-5 py-2 text-sm font-medium"
+            disabled={$preparing}
+            on:click={handleStop}>Stop</button
           >
         {/if}
       </div>

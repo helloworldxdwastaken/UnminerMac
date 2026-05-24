@@ -5,10 +5,26 @@ import (
 	"fmt"
 	"os/exec"
 	"runtime"
+	"strconv"
+	"strings"
 
 	"github.com/2nthony/webview"
 	"github.com/pkg/browser"
 )
+
+// detectPCores returns the number of performance cores on Apple Silicon,
+// or 0 if unknown (Intel Macs / non-Darwin / sysctl missing).
+func detectPCores() int {
+	out, err := exec.Command("sysctl", "-n", "hw.perflevel0.physicalcpu").Output()
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0
+	}
+	return n
+}
 
 // client events
 func RegisterIPCEvents(w webview.WebView) {
@@ -19,10 +35,12 @@ func RegisterIPCEvents(w webview.WebView) {
 		fmt.Println("emitPageReady")
 		w.Eval(fmt.Sprintf(`
         onPageReady({
-          cpuCores: %s
+          cpuCores: %d,
+          pCores: %d
         })
         `,
-			fmt.Sprint(runtime.NumCPU()),
+			runtime.NumCPU(),
+			detectPCores(),
 		))
 	})
 

@@ -1,16 +1,19 @@
 <script>
   import { tryOnMount } from '@svelte-use/core'
-  import { listen } from 'svelte/internal'
-  import '@shoelace-style/shoelace/dist/components/form/form'
-  import '@shoelace-style/shoelace/dist/components/range/range'
-
   import { form, cpuCores } from '../store'
-  import * as formUtils from '../util/form'
   import { useDispatch } from '../use/dispatch'
 
   const { dispatch } = useDispatch()
 
-  $: step = 100 / $cpuCores
+  // Step = one core's worth (so 4 P-cores on a 10-core M5 = 40%)
+  $: step = Math.max(1, Math.round(100 / $cpuCores))
+  $: threadsAtCurrent = Math.max(1, Math.round((tweakForm.cpuUsage / 100) * $cpuCores))
+  $: pCoreHint =
+    $cpuCores >= 8 && tweakForm.cpuUsage <= 50
+      ? 'Using P-cores only ✓ (best for RandomX)'
+      : tweakForm.cpuUsage > 50
+      ? 'E-cores included — may reduce sustained hashrate'
+      : ''
 
   let tweakForm = {
     cpuUsage: $form.cpuUsage,
@@ -19,32 +22,47 @@
   let formEl
 
   export function getFormData() {
-    return formEl.getFormData()
-  }
-  export function setFormData(data) {
-    formUtils.setFormData(formEl, data)
-    tweakForm = { ...tweakForm, ...data }
+    return new FormData(formEl)
   }
 
-  tryOnMount(() => {
-    formEl.childNodes.forEach((el) => {
-      if (el.name) {
-        listen(el, 'sl-change', (event) => {
-          dispatch('change', { ...$form, [el.name]: event.target.value })
-          tweakForm[el.name] = event.target.value
-        })
-      }
-    })
-  })
+  export function setFormData(data) {
+    if (!data) return
+    if (typeof data.cpuUsage === 'number' || typeof data.cpuUsage === 'string') {
+      tweakForm.cpuUsage = Number(data.cpuUsage)
+    }
+  }
+
+  function onSlide(event) {
+    tweakForm.cpuUsage = Number(event.target.value)
+    dispatch('change', { ...$form, cpuUsage: tweakForm.cpuUsage })
+  }
 </script>
 
-<sl-form bind:this={formEl} class="p-2">
-  <sl-range
-    name="cpuUsage"
-    label={`CPU Usage (${tweakForm.cpuUsage}%)`}
-    min={step}
-    max="100"
-    {step}
-    value={tweakForm.cpuUsage}
-  />
-</sl-form>
+<form bind:this={formEl} class="p-2">
+  <label class="block">
+    <div class="flex items-baseline justify-between mb-2">
+      <span class="font-medium">CPU Usage</span>
+      <span class="font-mono text-sky-400 text-lg"
+        >{tweakForm.cpuUsage}%</span
+      >
+    </div>
+    <input
+      type="range"
+      name="cpuUsage"
+      min={step}
+      max="100"
+      {step}
+      value={tweakForm.cpuUsage}
+      on:input={onSlide}
+      class="w-full accent-sky-500"
+    />
+    <div class="flex justify-between text-xs text-gray-400 mt-1">
+      <span>{step}%</span>
+      <span>~{threadsAtCurrent} of {$cpuCores} threads</span>
+      <span>100%</span>
+    </div>
+    {#if pCoreHint}
+      <p class="text-xs mt-3 text-gray-400">{pCoreHint}</p>
+    {/if}
+  </label>
+</form>

@@ -49,8 +49,12 @@
     <slot />
   </div>
 
-  <div slot="footer">
-    <sl-button bind:this={closeEl}>Close</sl-button>
+  <div slot="footer" class="flex items-center justify-end gap-3">
+    <button
+      type="button"
+      bind:this={closeEl}
+      class="glass-btn-ghost px-4 py-2 text-sm">Close</button
+    >
     <slot name="footer" />
   </div>
 </sl-drawer>

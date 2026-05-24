@@ -1,12 +1,11 @@
 <script>
-  import '@shoelace-style/shoelace/dist/components/button/button'
-
   import _isEqual from 'lodash.isequal'
   import Drawer from './Drawer.svelte'
   import FormSettings from './FormSettings.svelte'
   import { parseFormData } from '../util/form'
   import { form, isMining } from '../store'
   import { ipc } from '../ipc'
+  import { setStorage } from '../util/storage'
 
   let drawerComp
   let formSettingsComp
@@ -26,18 +25,21 @@
     })
 
     $form = { ...$form, ...data }
+    setStorage('form', $form)
 
     if ($isMining) {
+      saving = true
       ipc.listen('onMiningStopped', () => {
         ipc.listen('onMiningStarted', () => {
           saving = false
+          isChanged = false
           drawerComp.hide()
         })
         ipc.send('emitStartMining', JSON.stringify($form))
       })
-      saving = true
       ipc.send('emitStopMining')
     } else {
+      isChanged = false
       drawerComp.hide()
     }
   }
@@ -62,11 +64,17 @@
 >
   <FormSettings bind:this={formSettingsComp} on:change={onFormChange} />
 
-  <sl-button
+  <button
     slot="footer"
-    type="primary"
-    class="ml-4"
+    type="button"
+    class="glass-btn px-4 py-2 ml-4 text-sm"
     on:click={handleSave}
-    disabled={saving || !isChanged}>Save{$isMining ? ' & Restart' : ''}</sl-button
+    disabled={saving || !isChanged}
   >
+    {#if saving}
+      Restarting…
+    {:else}
+      Save{$isMining ? ' & Restart' : ''}
+    {/if}
+  </button>
 </Drawer>
