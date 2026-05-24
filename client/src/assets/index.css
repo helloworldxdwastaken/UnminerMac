@@ -68,7 +68,7 @@ body {
 .app-shell {
   max-width: 640px;
   margin: 0 auto;
-  padding: 24px 20px 32px;
+  padding: 18px 20px 22px;
   min-height: 100vh;
   display: flex;
   flex-direction: column;
@@ -111,7 +111,7 @@ body {
   -webkit-backdrop-filter: blur(32px) saturate(140%);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  padding: 24px;
+  padding: 16px 18px;
   box-shadow: var(--shadow-card);
 }
 
@@ -119,7 +119,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 20px;
+  margin-bottom: 12px;
 }
 
 .card-title {
@@ -272,11 +272,11 @@ body {
 .info-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 12px;
-  margin-bottom: 24px;
+  gap: 8px;
+  margin-bottom: 0;
 }
 .info-chip {
-  padding: 14px 16px;
+  padding: 10px 12px;
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -314,7 +314,7 @@ body {
 .divider {
   height: 1px;
   background: var(--border);
-  margin: 24px 0;
+  margin: 16px 0;
 }
 
 /* ---- Status dot ---- */

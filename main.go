@@ -55,9 +55,10 @@ func runApp() {
 	lib.RegisterIPCEvents(w)
 
 	w.SetTitle("UnminerMac")
-	// 560x720 to comfortably hold the new card-based UI (640px max-width
-	// app-shell with 20px side padding). Still fits any modern Mac display.
-	w.SetSize(560, 720, webview.HintFixed)
+	// 560x900 — wider for the new card-based UI, tall enough that the
+	// select-coin flow (algorithm + coin + wallet + referral + start)
+	// fits on screen without scrolling. Still fits any modern Mac display.
+	w.SetSize(560, 900, webview.HintFixed)
 
 	createServer()
 
