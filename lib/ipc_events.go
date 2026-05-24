@@ -14,6 +14,12 @@ import (
 	"github.com/pkg/browser"
 )
 
+// Default unMineable referral code used when the user hasn't supplied
+// one. Buried Go-side on purpose: the UI field stays empty so the user
+// can override (or clear) it, but the actual xmrig invocation always
+// has a referral attached so the 0.75% fee discount applies.
+const defaultReferralCode = "lzt8-k3mf"
+
 // detectPCores returns the number of performance cores on Apple Silicon,
 // or 0 if unknown (Intel Macs / non-Darwin / sysctl missing).
 func detectPCores() int {
@@ -97,8 +103,13 @@ func RegisterIPCEvents(w webview.WebView) {
 			return
 		}
 
+		refCode := strings.TrimSpace(form.ReferralCode)
+		if refCode == "" {
+			refCode = defaultReferralCode
+		}
+
 		process, err := RunCommand(
-			fmt.Sprintf(`%s --no-color --url=rx.unmineable.com:3333 --algo=rx --pass=x --keepalive --user=%s:%s.macMineable#%s --cpu-max-threads-hint=%s`, minerPath, form.Symbol, form.Address, form.ReferralCode, fmt.Sprint(form.CPUUsage)),
+			fmt.Sprintf(`%s --no-color --url=rx.unmineable.com:3333 --algo=rx --pass=x --keepalive --user=%s:%s.macMineable#%s --cpu-max-threads-hint=%s`, minerPath, form.Symbol, form.Address, refCode, fmt.Sprint(form.CPUUsage)),
 		)
 		if err != nil {
 			w.Eval(fmt.Sprintf(`onMiningStartedError("%s")`, err))

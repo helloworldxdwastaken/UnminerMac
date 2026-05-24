@@ -13,12 +13,12 @@
 
   $: label =
     $connectionStatus === 'online'
-      ? 'Connected to unMineable'
+      ? 'Connected to unMineable — ready to mine'
       : $connectionStatus === 'offline'
-      ? 'Cannot reach unMineable — check VPN/network'
+      ? "Can't reach the unMineable server. Either turn on your VPN (Cloudflare WARP / 1.1.1.1), install 1.1.1.1 encrypted DNS to bypass ISP/router blocking, or check your internet. Click to retry."
       : $connectionStatus === 'checking'
-      ? 'Checking connection…'
-      : 'Connection status unknown'
+      ? 'Checking connection to unMineable…'
+      : 'Connection status unknown — click to check'
 </script>
 
 <button
