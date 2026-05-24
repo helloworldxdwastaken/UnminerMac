@@ -371,6 +371,44 @@ static void hex_print(const char *label, const uint8_t *b, size_t n) {
     printf("\n");
 }
 
+// PBaaS canonicalisation pre-pass — mirrors verushash-node's `verusHashV2b2`
+// which, when the solution's first 4 bytes (sol_ver) are > 6, zeros out
+// every header field that's NOT canonical input to the verus_hash_v2 chain.
+// Without this step, the miner-side hash will NEVER match the pool-side
+// hash even with a perfect block header.
+//
+// Buffer layout (matches our worker_loop construction):
+//   [0..3]    nVersion
+//   [4..35]   hashPrevBlock                  → zeroed
+//   [36..67]  hashMerkleRoot                 → zeroed
+//   [68..99]  hashFinalSaplingRoot           → zeroed
+//   [100..103] nTime                          (preserved — canonical)
+//   [104..107] nBits                          → zeroed
+//   [108..139] nNonce                          → zeroed
+//   [140..142] outer solution varint (fd4005) (preserved)
+//   [143..146] sol_ver (07 00 00 00)          (preserved — read here)
+//   [147..150] descriptor                     (preserved)
+//   [151..214] hashPrevMMRRoot+hashBlockMMRRoot → zeroed
+//   [215..]   PBaaS extensions + miner tail  (preserved)
+//
+// Source: verushash-node/verushash.cc preprocessing of `buff` before
+// `vh2b2->Reset/Write/Finalize2b`. The zeroed regions match exactly the
+// memset calls in that file when sol_ver > 6.
+static void pbaas_canonicalize(uint8_t *buf, size_t len) {
+    if (len < 215) return;                       // not a PBaaS-sized buffer
+    const size_t SOL_OFF = 143;                  // header(140) + varint(3)
+    uint32_t sol_ver = (uint32_t)buf[SOL_OFF]
+                     | ((uint32_t)buf[SOL_OFF + 1] << 8)
+                     | ((uint32_t)buf[SOL_OFF + 2] << 16)
+                     | ((uint32_t)buf[SOL_OFF + 3] << 24);
+    if (sol_ver <= 6) return;                    // pre-PBaaS — no clear
+
+    memset(buf + 4,           0, 96);            // prev + merkle + sapling
+    memset(buf + 104,         0, 4);             // nBits
+    memset(buf + 108,         0, 32);            // nNonce
+    memset(buf + SOL_OFF + 8, 0, 64);            // PBaaS MMR root region
+}
+
 // VerusCoin node-stratum-pool's processShare() validator (lib/jobManager.js)
 // pulls expectedLength from EH_PARAMS_MAP keyed by the pool's N_K config.
 // LuckPool's configured (N,K) is unknown from the wire, so we cycle through
@@ -536,14 +574,24 @@ static void worker_loop(int thread_id, int n_threads, MinerShared *shared) {
             cached_seed_storage.assign(32, 0);
         }
 
+        // Pre-allocate a per-iteration scratch that mirrors hash_buf so we
+        // can apply the PBaaS canonicalisation without destroying the
+        // canonical bytes we need to keep mutating each loop.
+        std::vector<uint8_t> scratch(hash_buf.size());
+
         for (int n = 0; n < 50000 && !shared->stop.load(std::memory_order_relaxed); n++) {
             memcpy(nonce_iter_ptr, &local_nonce, 8);
             if (body_tail_room > 0) {
                 memcpy(body_tail_ptr, &local_nonce, body_tail_room);
             }
 
+            // Copy header+soln, then zero the same regions the pool zeros
+            // before hashing (matches verushash-node vh.hash2b2 exactly).
+            memcpy(scratch.data(), hash_buf.data(), hash_buf.size());
+            pbaas_canonicalize(scratch.data(), scratch.size());
+
             uint8_t hash[32];
-            verus_hash_v2_full(hash, hash_buf.data(), hash_buf.size(),
+            verus_hash_v2_full(hash, scratch.data(), scratch.size(),
                               hashKey_storage.data(), VERUSKEYSIZE,
                               cached_seed_storage.data());
 
