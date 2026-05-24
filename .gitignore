@@ -1,0 +1,9 @@
+.idea/
+node_modules
+.ds_store
+out/
+dist/
+.claude/
+verusminer/cpu/*.o
+verusminer/cpu/verusminer
+verusminer/cpu/verusminer_portable
