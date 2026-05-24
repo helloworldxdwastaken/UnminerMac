@@ -10,8 +10,9 @@ See [the research page](https://helloworldxdwastaken.github.io/UnminerMac/resear
 
 | Phase | Deliverable | Status |
 |---|---|---|
-| **0** | Skeleton + UnminerMac UI selector + Go multi-algo refactor | ⏳ in progress |
-| **1** | Haraka256 v2 + VerusHash 2.2 in C with ARM NEON intrinsics, validated against published test vectors, standalone `verusminer --bench` CLI | planned |
+| **0** | Skeleton + UnminerMac UI selector + Go multi-algo refactor | ✅ done (commit `19c888f`) |
+| **1a** | Haraka256 via sse2neon shim measured at **68 MH/s on M5 1 P-core**, paper test vector PASS | ✅ prototype done — see [cpu/RESULTS.md](cpu/RESULTS.md) |
+| **1b** | Full `verus_hash_v2()` integration + test vectors from VerusCoin's `src/test/` | next |
 | **2** | Stratum v1 protocol client, connect to a Verus pool (luckpool, zergpool, etc.), submit + validate shares | planned |
 | **3** | Integration with UnminerMac — spawn verusminer subprocess, hashrate display, accepted/rejected share counter | planned |
 | **4** | Metal compute shader port — bit-sliced AES + Haraka256 kernel, batched candidate-hash dispatch, bench vs CPU phase 1 | planned |
