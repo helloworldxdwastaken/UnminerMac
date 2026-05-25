@@ -12,6 +12,10 @@
 extern void clmul64(uint64_t a, uint64_t b, uint64_t *r);
 extern __m128i _mm_mulhrs_epi16_emu(__m128i a, __m128i b);
 
+// Full verusclhash entry point (lives in verus_clhash_portable.cpp).
+extern "C" uint64_t verusclhash_sv2_2_port(void *random, const unsigned char buf[64],
+                                            uint64_t keyMask, __m128i **pMoveScratch);
+
 // NOTE: most of the _mm_*_emu helpers in verus_clhash_portable.cpp are
 // declared `inline` and have NO exported symbol — so we can't `extern`
 // them and link. Instead, re-implement the small ones inline here using
@@ -80,6 +84,24 @@ void precomp_reduction64_wrap(const uint8_t *in_A, uint8_t *out) {
     for (int i = 0; i < 16; i++) {
         out[i] = (Q2[i] ^ in_A[i]) ^ Q3[i];
     }
+}
+
+
+// Friendly wrapper around verusclhash_sv2_2_port that handles the
+// pMoveScratch bookkeeping. Caller passes:
+//   - key      — VERUSKEYSIZE=8832 byte buffer (mutated in place!)
+//   - input    — 64 byte buffer
+//   - keyMask  — usually 8192 (= VERUSKEYSIZE - 40*16 - 1 rounded down,
+//                actually 0x2000 = 8192 for default Verus 2.2 config)
+// Returns the 64-bit verusclhash output.
+uint64_t verusclhash_sv2_2_wrap(uint8_t *key, const uint8_t *input, uint64_t keyMask) {
+    // pMoveScratch records mutated key slots so caller can restore them.
+    // We allocate enough for 32 iters × 2 ptrs = 64 entries.
+    // pMoveScratch points to a writable array of __m128i*; the function
+    // advances its local copy as it logs mutated slots. We discard.
+    __m128i *scratch[80];
+    __m128i **scratchPtr = scratch;
+    return verusclhash_sv2_2_port(key, input, keyMask, scratchPtr);
 }
 
 } // extern "C"
