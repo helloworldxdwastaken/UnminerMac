@@ -32,7 +32,71 @@ extern void load_constants_port(void);
 // with the pool's vh.hash2b2.
 #include "canonical/verus_hash.h"
 
+// libsodium for blake2b with "VerusDefaultHash" personalization. Required
+// by the PBaaS preprocessing in VerusCoin/verushash-node — pool computes
+// blake2b on the preHeader and checks it against solution[124..156] before
+// hashing. If we don't update solution[124..156] when we change the nonce,
+// pool's match fails and returns 0xff..ff → "low difficulty share".
+#include <sodium.h>
+
 #include "stratum.h"
+
+// "VerusDefaultHash" — same personalization used by verushash-node.
+static const unsigned char BLAKE2B_VERUS_PERSONAL[crypto_generichash_blake2b_PERSONALBYTES] =
+    { 'V','e','r','u','s','D','e','f','a','u','l','t','H','a','s','h' };
+
+// Compute blake2b-256 of the 196-byte preHeader using the "VerusDefaultHash"
+// personalization. Returns true on success.
+static bool blake2b_verus(uint8_t out[32], const uint8_t *preHeader, size_t pre_len) {
+    crypto_generichash_blake2b_state state;
+    if (crypto_generichash_blake2b_init_salt_personal(
+            &state, nullptr, 0, 32, nullptr, BLAKE2B_VERUS_PERSONAL) != 0) {
+        return false;
+    }
+    if (crypto_generichash_blake2b_update(&state, preHeader, pre_len) != 0) return false;
+    if (crypto_generichash_blake2b_final(&state, out, 32) != 0) return false;
+    return true;
+}
+
+// Build the 196-byte preHeader exactly the way verushash-node does and
+// write blake2b(preHeader) into solution[124..156] of buf. After this,
+// pool's blake2b match will succeed when it processes our submission
+// (the canonical clear of non-canonical regions then fires and pool
+// hashes the cleared buffer — same as us, so hashes agree).
+//
+// Layout (offsets are from buf[0]):
+//   preHeader[0..32]    = buf[4..36]    (hashPrevBlock)
+//   preHeader[32..64]   = buf[36..68]   (hashMerkleRoot)
+//   preHeader[64..96]   = buf[68..100]  (hashFinalSaplingRoot)
+//   preHeader[96..128]  = buf[108..140] (nNonce, skipping nTime[100..104])
+//   preHeader[128..132] = buf[104..108] (nBits)
+//   preHeader[132..196] = solution[8..72] = buf[151..215]
+// Then solution[124..156] = buf[267..299] = blake2b(preHeader).
+static void pbaas_embed_blake2b(uint8_t *buf, size_t len) {
+    if (len < 299) return;
+    uint8_t pre[196] = {0};
+    memcpy(pre +   0, buf +   4, 32);   // prevhash
+    memcpy(pre +  32, buf +  36, 32);   // merkleroot
+    memcpy(pre +  64, buf +  68, 32);   // sapling
+    memcpy(pre +  96, buf + 108, 32);   // nNonce
+    memcpy(pre + 128, buf + 104,  4);   // nBits
+    memcpy(pre + 132, buf + 151, 64);   // solution[8..72]
+    uint8_t hash[32];
+    if (blake2b_verus(hash, pre, sizeof(pre))) {
+        memcpy(buf + 267, hash, 32);     // write into solution[124..156]
+    }
+}
+
+// Mirror the regions pool zeros after the blake2b match. We need to hash
+// the SAME buffer pool will hash (i.e. post-clear), so we apply the clear
+// locally before calling verus_hash_v2.
+static void pbaas_apply_clear(uint8_t *buf, size_t len) {
+    if (len < 215) return;
+    memset(buf +   4, 0, 96);   // prev + merkle + sapling
+    memset(buf + 104, 0,  4);   // nBits
+    memset(buf + 108, 0, 32);   // nNonce
+    memset(buf + 151, 0, 64);   // solution[8..72]
+}
 
 // (verus_hash_v2_full + cvh2_init_once defined later in the file, after
 // their dependencies — KEYMASK, generate_cl_key_cached, etc. Forward
@@ -686,24 +750,37 @@ static void worker_loop(int thread_id, int n_threads, MinerShared *shared) {
         // thread-safe).
         thread_local CVerusHashV2 vh2(SOLUTION_VERUSHHASH_V2_2);
 
-        // Iteration counter goes at the END of the header nonce field
-        // (last 8 bytes), AFTER extranonce1 and after the 20 reserved
-        // zero bytes. Pool reads our submitted params[3] (28 bytes) and
-        // prepends en1 to form the 32-byte nonce — so as long as the
-        // 28 bytes we submit match hash_buf[NONCE_OFFSET+4..+32], the
-        // pool's hash buffer matches ours.
+        // Per-iteration mutation: last 8 bytes of header nonce slot.
+        // Pool's processShare reads our submitted params[3] (28 bytes) and
+        // prepends en1 → 32 bytes of nonce. After we update the nonce, we
+        // recompute blake2b(preHeader) and embed it in solution[124..156]
+        // so the pool's blake2b match succeeds and pool clears + hashes
+        // the canonical buffer (which we mirror locally before hashing).
         uint8_t *hdr_iter_ptr = hash_buf.data() + NONCE_OFFSET + (NONCE_FIELD - 8);
 
+        // Scratch buffer for the cleared version we actually hash —
+        // allocated once per outer loop iteration to avoid per-hash
+        // malloc cost.
+        std::vector<uint8_t> scratch(hash_buf.size());
+
         for (int n = 0; n < 50000 && !shared->stop.load(std::memory_order_relaxed); n++) {
-            // Mutate ONLY the last 8 bytes of the header nonce slot.
-            // The soln tail stays constant (it only needs en1 for the
-            // pool's substr(-30).indexOf(en1) check, which we already
-            // satisfy from build_submit_soln).
+            // 1. Mutate nonce (drives hash diversity)
             memcpy(hdr_iter_ptr, &local_nonce, 8);
+
+            // 2. Recompute blake2b(preHeader) and embed at solution[124..156].
+            //    This is what makes pool's PBaaS match succeed — without
+            //    this, pool's vh.hash2b2 returns 0xff..ff and the share is
+            //    rejected as "low difficulty share" no matter what we hash.
+            pbaas_embed_blake2b(hash_buf.data(), hash_buf.size());
+
+            // 3. Copy + clear (mirror what pool's vh.hash2b2 does
+            //    internally after the blake2b match passes).
+            memcpy(scratch.data(), hash_buf.data(), hash_buf.size());
+            pbaas_apply_clear(scratch.data(), scratch.size());
 
             uint8_t hash[32];
             vh2.Reset();
-            vh2.Write(hash_buf.data(), hash_buf.size());
+            vh2.Write(scratch.data(), scratch.size());
             vh2.Finalize2b(hash);
 
             // PRIMARY check: pool's processShare interprets the hash as a
