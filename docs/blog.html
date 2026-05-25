@@ -165,8 +165,8 @@
 <article>
   <div class="container">
     <h1>Building VerusHash on Apple Silicon</h1>
-    <p class="lede">A working postmortem from one week of debugging share rejections, hunting a 3.8× CPU speedup that was hiding in the inner loop, and validating every cryptographic primitive of VerusHash 2.2 on the Apple M5 GPU.</p>
-    <p class="meta">Verox Studio engineering notes · M5 (10-core, 4P+6E, macOS Tahoe 26.4) · v0.19.0</p>
+    <p class="lede">A working postmortem from a week of debugging share rejections, hunting a 3.8× CPU speedup that was hiding in the inner loop, validating every cryptographic primitive of VerusHash 2.2 on the Apple M5 GPU, and then learning — by shipping it — that VerusHash is structurally hostile to <em>every</em> GPU ever built. Including the RTX 4090.</p>
+    <p class="meta">Verox Studio engineering notes · M5 (10-core, 4P+6E, macOS Tahoe 26.4) · v0.20.0 — first Metal VerusHash with pool-accepted shares</p>
 
     <div class="chapters">
       <h3>Chapters</h3>
@@ -176,6 +176,7 @@
         <li><a href="#speedup">The 3.8× speedup hiding in the inner loop</a></li>
         <li><a href="#metal-port">Five Metal primitives, byte-perfect</a></li>
         <li><a href="#whats-next">What's next: GPU mining + honest expectations</a></li>
+        <li><a href="#metal-reality">We built it. The honest performance story.</a></li>
       </ol>
     </div>
 
@@ -433,6 +434,88 @@ inline void aesenc_tt(thread uint *s, constant uint *rk) {
     </ul>
 
     <p>And if you're working on the same problem (VerusHash, Apple Silicon, Metal compute) — drop a note on the GitHub issues. We'd rather not duplicate the debug cycles.</p>
+
+    <h2 id="metal-reality">6. We built it. The honest performance story.</h2>
+
+    <p class="meta" style="margin-top:-8px">Update — v0.20.0, after actually shipping the GPU integration.</p>
+
+    <p>Chapter 5 above was written <em>before</em> the GPU mining integration was finished. It predicted <strong>12–20 MH/s</strong> on Metal. We finished the integration. Pool-accepted shares now come out of the Apple M5 GPU. The number is <strong>0.51 MH/s</strong>. The original prediction was wrong by an order of magnitude. Here's why, and why we're shipping the GPU mode anyway as a research artifact rather than a production speedup.</p>
+
+    <h3>What we built</h3>
+
+    <p>v0.20 ships:</p>
+    <ul>
+      <li>A Metal compute kernel (<code>verus_mine_kernel</code>) that does the full Reset + Write + Finalize2b pipeline per GPU thread, mutates the 8-byte nonce slot on the fly, and compares the resulting hash against the pool target on the GPU. Winners are atomically logged.</li>
+      <li>An Objective-C++ bridge (<code>metal_bridge.mm</code>) the C++ miner calls via a small C-compatible API.</li>
+      <li><code>--gpu</code> flag + <code>gpu_worker_loop</code> in the miner with trust-but-verify: the first 16 winners are recomputed on CPU and compared before submission. 3 mismatches → abort.</li>
+      <li>UI toggle "Use Metal GPU (experimental)" in Settings.</li>
+    </ul>
+
+    <p>First live test: <code>[GPU-SHARE] nonce=c86e47 ... [SHARE ✓] accepted (total: 1)</code>. Pool accepted the GPU-found share on the first try. So we know the algorithm is correct end-to-end.</p>
+
+    <h3>What the numbers actually look like</h3>
+
+    <table style="margin:18px 0">
+      <thead><tr><th>Setup</th><th>Hashrate</th><th>Key memory</th></tr></thead>
+      <tbody>
+        <tr><td>M5 CPU, 7 threads</td><td><strong>3.88 MH/s</strong></td><td>~64 KB</td></tr>
+        <tr><td>M5 GPU, batch=256</td><td>0.05 MH/s</td><td>6 MB</td></tr>
+        <tr><td>M5 GPU, batch=8192</td><td><strong>0.51 MH/s</strong></td><td>192 MB</td></tr>
+        <tr><td>M5 GPU, batch=32768</td><td>0.68 MH/s</td><td>768 MB</td></tr>
+      </tbody>
+    </table>
+
+    <p>So the GPU is roughly <strong>5–7× <em>slower</em> than the CPU</strong>, and bigger batches barely help. Why?</p>
+
+    <h3>The actual ceiling, with arithmetic</h3>
+
+    <p>The M5 GPU has 10 cores × 128 ALUs = 1,280 ALUs at ~1.5 GHz, peak ~3.85 TFLOPS FP32 (<a href="https://www.michaelstinkerings.org/apple-m5-gpu-roofline-analysis/" target="_blank" rel="noopener">measured roofline analysis</a>). On paper, plenty of compute for mining.</p>
+
+    <p>But VerusHash's hot loop (<code>verusclhash</code>) has properties that GPUs structurally hate:</p>
+
+    <ul>
+      <li><strong>An 8-way <code>switch</code> per iteration, 32 iterations per hash.</strong> Threads in the same 32-lane SIMD warp take different branches on different selector values. The hardware serializes the divergent lanes. Apple's own <a href="https://developer.apple.com/videos/play/wwdc2020/10013/" target="_blank" rel="noopener">WWDC20 Metal guidance</a> explicitly warns about this — penalty is up to <strong>8×</strong> on heavy divergence.</li>
+      <li><strong>24 KB of per-hash state</strong> (the CL hash key). M5 threadgroup memory is 32 KB/core. That means at most ~1 hash in flight per threadgroup, and with the GPU's register-file constraints, you get maybe <strong>~40 concurrent hashes total</strong> across all 10 cores. The thousands of threads you'd need to hide GPU latency simply do not fit.</li>
+      <li><strong>No native carryless multiply.</strong> CPUs have <code>PCLMULQDQ</code> (Intel) and <code>PMULL</code> (ARMv8). Apple Silicon GPUs do not. We emulate it with shifts/XORs at ~10× the cost of the hardware instruction.</li>
+      <li><strong>Zero intra-hash parallelism.</strong> A single VerusHash is a serial dependency chain — you can't SIMD-vectorize within one hash. All parallelism comes from running many independent hashes simultaneously, which collides with the memory constraint above.</li>
+    </ul>
+
+    <p>Realistic Metal ceiling on M5 with <em>weeks</em> of further optimization (threadgroup-shared T-tables, smaller per-thread footprint, multi-dispatch pipelining): <strong>~1–2 MH/s</strong>. Still below the 3.88 MH/s CPU.</p>
+
+    <h3>This isn't an Apple Silicon problem. It's a VerusHash problem.</h3>
+
+    <p>The thing that makes this resigned-shrug funny instead of frustrating: <strong>VerusHash beats GPUs on every platform that's ever existed</strong>. From <a href="https://www.hashrate.no/coins/VRSC/benchmarks" target="_blank" rel="noopener">Hashrate.no's VerusHash benchmarks</a>:</p>
+
+    <table style="margin:18px 0">
+      <thead><tr><th>Hardware</th><th>VerusHash 2.2</th></tr></thead>
+      <tbody>
+        <tr><td>AMD EPYC 9754 (128-core CPU)</td><td>272 MH/s</td></tr>
+        <tr><td>AMD Ryzen 9 7950X (16-core CPU)</td><td>63.97 MH/s</td></tr>
+        <tr><td>Apple M5 (10-core, our baseline)</td><td>3.88 MH/s</td></tr>
+        <tr><td>NVIDIA RTX 3080 (ccminer-verus)</td><td>~14 MH/s</td></tr>
+        <tr><td>NVIDIA GTX 1080 Ti</td><td>~6 MH/s</td></tr>
+      </tbody>
+    </table>
+
+    <p>The top-ranked benchmarks don't have a single GPU. NVIDIA's RTX 3080 loses to a 16-core consumer CPU by 4–5×. The "RTX 4090 does 80 MH/s on VerusHash" number that floats around in chat is not corroborated by any benchmark site we could find. <a href="https://cryptomining-blog.com/12133-verus-coin-vrsc-verushash-2-1-algorithm-mining-with-cpu/" target="_blank" rel="noopener">Crypto Mining Blog wrote in 2019</a>: "GPU mining of VerusHash is uneconomical." Five years and two algorithm revisions later, that's still true.</p>
+
+    <p>It's by design. <a href="https://medium.com/veruscoin/veruscoin-0-5-0-official-release-notes-6d371095dc7a" target="_blank" rel="noopener">Verus 2.0's release notes</a> explicitly target CPU mining. <a href="https://github.com/tevador/RandomX" target="_blank" rel="noopener">RandomX</a> (Monero's algorithm) does the same thing for the same reasons: branchy VM with random scratchpad access, plus operations CPUs do natively and GPUs have to emulate. CPUs and GPUs are fundamentally different machines, and an algorithm that picks features one has and the other doesn't will be lopsided.</p>
+
+    <h3>What this is good for</h3>
+
+    <p>If GPU mining VerusHash is a dead-end performance-wise, why ship it? Three reasons:</p>
+
+    <ol>
+      <li><strong>It's the first one.</strong> We searched GitHub, the Verus org, the Apple developer forums, and r/CryptoMining / r/AppleSilicon — nobody has published a Metal port of VerusHash 2.2 before, with or without accepted shares. The kernel + bridge (MIT-licensed in <a href="https://github.com/helloworldxdwastaken/UnminerMac/tree/main/verusminer/metal" target="_blank" rel="noopener">verusminer/metal/</a>) is now the reference any future Apple Silicon mining effort can fork. Maybe someone reading this from the Verus team takes it further with bit-sliced AES; the structural ceiling is ~1–2 MH/s, but our 0.51 is well below that, and the kernel design has obvious places to improve.</li>
+      <li><strong>It's a correctness artifact.</strong> The cryptographic primitives (Haraka256/512, CL hash, AES T-tables, GF(2<sup>128</sup>) clmul, mulhrs, precomp reduction) all have <code>validate_*.swift</code> harnesses comparing the GPU output byte-for-byte against the canonical <code>CVerusHashV2</code> CPU reference. 7 harnesses, ~2,100 test vectors, all green. If you want to <em>study</em> VerusHash on a GPU, this is a clean reference implementation that's known to match the canonical.</li>
+      <li><strong>It made the CPU faster.</strong> Building the GPU port forced us to think hard about what work is per-job (do once, cache) vs per-nonce (must redo). That insight produced the <strong>3.8× CPU speedup</strong> in v0.19 — which is the entire actual revenue improvement of this whole arc. The GPU "failed" at its stated goal but caused the CPU to do its real job better.</li>
+    </ol>
+
+    <h3>What we're not going to do</h3>
+
+    <p>Build a bit-sliced AES kernel. Spend three weeks chasing a theoretical 8–12 MH/s on a path that <em>might</em> match the CPU. Solo, the ROI is bad. The honest answer is that VerusHash on Apple Silicon GPU is a research-grade demonstrator, the CPU is the production miner, and the next optimization-effort dollar is better spent on the CPU side (P-core pinning, dual-mining VerusHash on P-cores + RandomX on E-cores, etc.) than on the GPU.</p>
+
+    <p>If you're working on Apple Silicon Metal mining and disagree — <a href="https://github.com/helloworldxdwastaken/UnminerMac/issues" target="_blank" rel="noopener">open an issue</a>, fork the kernel, prove us wrong. Honestly, that would be the best outcome of shipping this.</p>
 
   </div>
 </article>
