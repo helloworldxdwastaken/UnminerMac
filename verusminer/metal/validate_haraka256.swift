@@ -24,7 +24,11 @@ func haraka256_port(_ out: UnsafeMutablePointer<UInt8>,
 func load_constants_port()
 
 // ---- GPU dispatch ----
-let kernelPath = FileManager.default.currentDirectoryPath + "/haraka256.metal"
+// Swap to the v2 file by passing argv[1]="v2" — defaults to original
+let kernelFile = (CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "v2")
+    ? "haraka256_v2.metal" : "haraka256.metal"
+let kernelPath = FileManager.default.currentDirectoryPath + "/" + kernelFile
+print("Loading kernel: \(kernelFile)")
 guard let kernelSrc = try? String(contentsOfFile: kernelPath, encoding: .utf8) else {
     fatalError("Cannot load haraka256.metal from cwd")
 }
