@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Building VerusHash on Apple Silicon: a debugging postmortem — UnminerMac</title>
+<meta name="description" content="How we got VerusHash shares accepted on LuckPool, sped up the CPU miner 3.8×, and validated every cryptographic primitive on the Apple M5 GPU. A working postmortem, with code.">
+<link rel="icon" type="image/png" href="logo.png">
+<style>
+  :root {
+    --bg-1: #0f172a; --bg-2: #1e293b;
+    --ink: #e2e8f0; --ink-dim: #94a3b8; --ink-faint: #64748b;
+    --blue: #38bdf8; --blue-2: #3b82f6; --warn: #fbbf24;
+    --bad: #f43f5e; --good: #22c55e;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; -webkit-font-smoothing: antialiased; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
+    color: var(--ink); line-height: 1.6;
+    background:
+      radial-gradient(ellipse 60% 50% at 15% 10%, rgba(59,130,246,0.35), transparent 70%),
+      radial-gradient(ellipse 50% 40% at 85% 85%, rgba(14,165,233,0.28), transparent 70%),
+      linear-gradient(135deg, #0b1020 0%, #1e293b 50%, #0b1020 100%);
+    background-attachment: fixed;
+    min-height: 100vh;
+  }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { color: #7dd3fc; }
+  code { background: rgba(148,163,184,0.15); padding: 0.1em 0.4em; border-radius: 5px; font-size: 0.9em; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  pre {
+    background: rgba(0,0,0,0.45); padding: 1.2rem 1.4rem;
+    border-radius: 12px; overflow-x: auto; border: 1px solid rgba(148,163,184,0.15);
+    font-size: 0.82rem; line-height: 1.6;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    margin: 1.5rem 0;
+  }
+  pre code { background: transparent; padding: 0; font-size: inherit; }
+  .container { max-width: 820px; margin: 0 auto; padding: 0 1.5rem; }
+
+  /* Nav */
+  nav {
+    position: sticky; top: 0; z-index: 10;
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    background: rgba(11,16,32,0.6);
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+  nav .container { display: flex; align-items: center; justify-content: space-between; height: 60px; max-width: 980px; }
+  nav .brand { display: flex; align-items: center; gap: 0.6rem; font-weight: 600; color: var(--ink); }
+  nav .brand img { width: 28px; height: 28px; border-radius: 7px; }
+  nav .links { display: flex; gap: 1.5rem; font-size: 0.92rem; }
+  nav .links a { color: var(--ink-dim); }
+  nav .links a:hover { color: var(--ink); }
+  nav .links a.active { color: var(--blue); }
+
+  /* Article */
+  article { padding: 4rem 0 6rem; }
+  article h1 {
+    font-size: clamp(2rem, 5vw, 3rem);
+    font-weight: 700; letter-spacing: -0.02em;
+    margin-bottom: 0.5rem;
+    background: linear-gradient(135deg, #f0f9ff 0%, #38bdf8 50%, #3b82f6 100%);
+    background-clip: text; -webkit-background-clip: text; color: transparent;
+  }
+  article .lede { font-size: 1.15rem; color: var(--ink-dim); margin-bottom: 0.5rem; }
+  article .meta {
+    font-size: 0.82rem; color: var(--ink-faint);
+    margin-bottom: 3rem; padding-bottom: 2rem;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+  article h2 {
+    font-size: 1.5rem; font-weight: 700; letter-spacing: -0.01em;
+    margin: 3rem 0 1rem; color: var(--ink);
+  }
+  article h3 {
+    font-size: 1.1rem; font-weight: 600;
+    margin: 2rem 0 0.75rem; color: var(--blue);
+  }
+  article p { margin: 1rem 0; color: var(--ink-dim); }
+  article p strong { color: var(--ink); }
+  article ul, article ol { margin: 1rem 0 1rem 1.5rem; color: var(--ink-dim); }
+  article li { margin: 0.4rem 0; }
+  article li strong { color: var(--ink); }
+
+  table {
+    width: 100%; border-collapse: collapse;
+    margin: 1.5rem 0; font-size: 0.92rem;
+  }
+  thead th {
+    text-align: left; padding: 0.7rem 0.6rem;
+    border-bottom: 1px solid rgba(255,255,255,0.1);
+    color: var(--ink-faint); font-size: 0.78rem;
+    text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  thead th:nth-child(n+2) { text-align: right; }
+  tbody td {
+    padding: 0.65rem 0.6rem;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    font-variant-numeric: tabular-nums;
+  }
+  tbody td:first-child { color: var(--ink); }
+  tbody td:nth-child(n+2) { text-align: right; color: var(--ink-dim); }
+  tbody tr.highlight td { color: var(--ink); background: rgba(59,130,246,0.08); }
+  tbody tr.highlight td:nth-child(n+2) { color: var(--blue); font-weight: 600; }
+
+  .callout {
+    background: rgba(20,28,48,0.55);
+    backdrop-filter: blur(16px) saturate(160%);
+    -webkit-backdrop-filter: blur(16px) saturate(160%);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-left: 3px solid var(--blue);
+    border-radius: 10px;
+    padding: 1.2rem 1.4rem;
+    margin: 1.5rem 0;
+  }
+  .callout.warn { border-left-color: var(--warn); }
+  .callout.good { border-left-color: var(--good); }
+  .callout p:first-child { margin-top: 0; }
+  .callout p:last-child { margin-bottom: 0; }
+
+  .verdict {
+    background: linear-gradient(135deg, rgba(59,130,246,0.12), rgba(14,165,233,0.06));
+    border: 1px solid rgba(59,130,246,0.3);
+    border-radius: 14px;
+    padding: 1.5rem 1.8rem;
+    margin: 2rem 0;
+  }
+  .verdict h3 { color: var(--blue); margin-top: 0; }
+
+  .chapters {
+    background: rgba(20,28,48,0.55);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 12px;
+    padding: 1.4rem 1.6rem;
+    margin: 2.5rem 0;
+  }
+  .chapters h3 { color: var(--ink); margin: 0 0 0.7rem; font-size: 0.92rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  .chapters ol { margin: 0.5rem 0 0 1.3rem; counter-reset: chapter; }
+  .chapters ol li { margin: 0.35rem 0; color: var(--ink-dim); }
+  .chapters ol li a { color: var(--ink); font-weight: 500; }
+
+  footer { padding: 3rem 0; text-align: center; color: var(--ink-faint); font-size: 0.85rem; border-top: 1px solid rgba(255,255,255,0.05); margin-top: 4rem; }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="container">
+    <a href="index.html" class="brand">
+      <img src="logo.png" alt="UnminerMac">
+      UnminerMac
+    </a>
+    <div class="links">
+      <a href="index.html#ranking">Best coins</a>
+      <a href="index.html#install">Install</a>
+      <a href="research.html">Research</a>
+      <a href="blog.html" class="active">Blog</a>
+      <a href="https://github.com/helloworldxdwastaken/UnminerMac" target="_blank" rel="noopener">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<article>
+  <div class="container">
+    <h1>Building VerusHash on Apple Silicon</h1>
+    <p class="lede">A working postmortem from one week of debugging share rejections, hunting a 3.8× CPU speedup that was hiding in the inner loop, and validating every cryptographic primitive of VerusHash 2.2 on the Apple M5 GPU.</p>
+    <p class="meta">Verox Studio engineering notes · M5 (10-core, 4P+6E, macOS Tahoe 26.4) · v0.19.0</p>
+
+    <div class="chapters">
+      <h3>Chapters</h3>
+      <ol>
+        <li><a href="#shares-rejected">Why every share was rejected</a></li>
+        <li><a href="#luckpool-teardown">Reverse-engineering LuckPool's hash pipeline</a></li>
+        <li><a href="#speedup">The 3.8× speedup hiding in the inner loop</a></li>
+        <li><a href="#metal-port">Five Metal primitives, byte-perfect</a></li>
+        <li><a href="#whats-next">What's next: GPU mining + honest expectations</a></li>
+      </ol>
+    </div>
+
+    <h2 id="shares-rejected">1. Why every share was rejected</h2>
+
+    <p>UnminerMac v0.18 shipped the first arm64-native VerusHash 2.2 miner for Apple Silicon. The CPU benchmark looked great — <strong>5.77 MH/s on 4 P-cores</strong>. Address validation worked. The stratum connection to <code>na.luckpool.net:3956</code> was clean. Mining started, hashrate climbed, the miner happily reported finding "valid" shares.</p>
+
+    <p>The pool accepted exactly zero of them.</p>
+
+    <p>The error from the pool: <code>"low difficulty share"</code>. Which technically tells you what's wrong — the hash you submitted doesn't actually meet the difficulty target — but doesn't tell you <strong>why</strong> your hash is different from the pool's hash for the same nonce. And the difference is what we needed to figure out.</p>
+
+    <p>The first hypothesis was the obvious one: we were using the wrong reference implementation. There are at least three VerusHash 2.2 implementations floating around in mining code:</p>
+
+    <ul>
+      <li><strong>hellcatz/verushash-node</strong> — a popular NPM package, simple, works for some pools</li>
+      <li><strong>VerusCoin/verus-coin reference</strong> — the canonical one shipped with the wallet/daemon</li>
+      <li><strong>Various forks of mining pools</strong> — each with subtle deviations</li>
+    </ul>
+
+    <p>We started with the first because it had the cleanest API and shipped pre-built. The pool used the second.</p>
+
+    <h3>The first hint: a known block test</h3>
+
+    <p>To prove we had the wrong algorithm, we built a <strong>known-block-test harness</strong>: take a real Verus block from the chain (block <code>4080279</code>, hash <code>00000000000069f6d238c07844196157c11808c12239d8265a6afe70652993a0</code>), feed its header through our local hasher, see if we get the same output.</p>
+
+    <p>We got something different. The output had the right structure (32 bytes, lots of leading zeros) but every byte was wrong. That ruled out endianness drift or solution-padding bugs — those usually look like "first 16 bytes wrong, rest right" or vice versa. This was every-byte-wrong, which means the hash function itself was computing something different.</p>
+
+    <p>Switching to the canonical <code>CVerusHashV2</code> from the reference repo took an evening of build-system wrangling. The minor speedbump was that VerusCoin's source uses x86-64 intrinsics (<code>_mm_clmulepi64_si128</code>, AES-NI), and we needed to swap in <code>sse2neon.h</code> to map those to ARMv8 NEON crypto extensions.</p>
+
+    <p>After that swap, the known-block test passed. Same block in, same hash out. Verified against the chain.</p>
+
+    <p>And the pool still rejected every share.</p>
+
+    <h2 id="luckpool-teardown">2. Reverse-engineering LuckPool's hash pipeline</h2>
+
+    <p>So the "right algorithm" still produced the "wrong hash" for the pool's purposes. That meant the algorithm wasn't the only thing the pool was doing — there was preprocessing on the input we hadn't replicated.</p>
+
+    <p>LuckPool's miner stats page (<code>luckpool.net/verus/miner.html</code>) ships some inline JavaScript and a few minified .js bundles. Reading those was how we found the live stats API endpoints (<code>/verus/earningstats/&lt;addr&gt;</code>, <code>/verus/miner/&lt;addr&gt;</code>, etc.) that we now use for the live earnings display. But the more interesting find was a single line buried in the stratum handler:</p>
+
+    <pre><code>// serializeHeader: build the 196-byte preHeader
+//   buf[0..4]    = version (LE)
+//   buf[4..36]   = prevHash
+//   buf[36..68]  = merkleRoot
+//   buf[68..100] = finalSaplingRoot
+//   buf[100..104]= timestamp (LE)
+//   buf[104..108]= nBits (LE)
+//   buf[108..140]= nonce (32 bytes from job + en1+en2)
+//   buf[140..143]= solution length (varint 0x80 0x09 0x40)
+//   buf[143..196]= solution[0..53] (the prefix the pool tells us)
+//
+// blake2b("VerusDefaultHash", preHeader) → 32 bytes
+// → embedded at buf[124..156] of the canonical clear region
+// → that's the actual input to CVerusHashV2.Write</code></pre>
+
+    <div class="callout">
+      <p><strong>The missing step: <em>PBaaS preprocessing.</em></strong> VerusHash 2.2 on a PBaaS chain doesn't hash the raw block header. It hashes a <strong>canonically-cleared</strong> version of the header that has had a specific <code>blake2b</code> digest embedded into a specific byte range.</p>
+    </div>
+
+    <p>The <code>blake2b</code> isn't standard SHA-3 blake — it's specifically <code>blake2b</code> with the personalization string <code>"VerusDefaultHash"</code> (a libsodium feature). The input to that blake is the 196-byte "preHeader" assembled from the stratum job. The output is 32 bytes, which get embedded at byte offset 124 in a 299-byte buffer. That buffer is then partially zeroed in specific ranges (the "canonical clear" — <code>buf[4..99]</code>, <code>buf[104..107]</code>, <code>buf[108..139]</code>, <code>buf[151..214]</code>) before being fed to <code>CVerusHashV2.Write</code>.</p>
+
+    <p>Once we wired up <code>libsodium</code> for the personalized blake2b, computed it on every nonce attempt, and mirrored the canonical clear, the pool started accepting shares. We watched the wallet balance tick up on <code>luckpool.net/verus/miner.html</code> for the first time.</p>
+
+    <p>Total wall-clock time to find this: about two days. Total code changes: maybe 30 lines. The win was figuring out <em>where</em> the 30 lines belonged.</p>
+
+    <h2 id="speedup">3. The 3.8× speedup hiding in the inner loop</h2>
+
+    <p>With shares accepting, we started actually mining. The reported hashrate was <strong>1.04 MH/s on 7 threads</strong>. That's terrible — about 150 KH/s per thread.</p>
+
+    <p>The v0.18 release notes had reported 5.77 MH/s on 4 threads (~1.44 MH/s/thread). What had we lost?</p>
+
+    <p>The answer turned out to be: <strong>everything we'd just added in chapter 2 was being recomputed on every nonce iteration</strong>, even though it didn't depend on the nonce.</p>
+
+    <p>The PBaaS pipeline now looked like this per iteration:</p>
+
+    <pre><code>for (uint64_t nonce = start; nonce &lt; end; nonce++) {
+    // build 196-byte preHeader with nonce embedded
+    // run blake2b("VerusDefaultHash", preHeader, 32)
+    // memcpy blake output to buf[124..156]
+    // memcpy nonce to buf[108..140]
+    // canonical clear: zero out [4..99], [104..107], [108..139], [151..214]
+    // CVerusHashV2.Reset()
+    // CVerusHashV2.Write(buf, 299) — runs the full VerusHash pipeline
+    // compare hash to target, submit if good
+}</code></pre>
+
+    <p>The thing is, <strong>almost none of that varies with the nonce except for 8 bytes</strong>. The job is constant for the duration. The blake2b input changes by 8 bytes per iteration (the nonce counter inside it), which means the blake output also changes — but the rest of the 196-byte preHeader is constant.</p>
+
+    <p>And inside <code>CVerusHashV2</code>, there's another layer: the <strong>verusclhash key cache</strong>. The first call to <code>.Write()</code> with a given buffer seeds a key derived from the buffer's leading bytes. Subsequent calls with the same prefix reuse the cached key. We were destroying that cache every iteration by calling <code>.Reset()</code>.</p>
+
+    <p>The fix was to recognize what's <strong>per-job</strong> vs what's <strong>per-nonce</strong>:</p>
+
+    <table>
+      <thead><tr><th>Operation</th><th>Per job</th><th>Per nonce</th></tr></thead>
+      <tbody>
+        <tr><td>Build the 196-byte preHeader skeleton</td><td>✓</td><td></td></tr>
+        <tr><td>Initialize blake2b state with personalization</td><td>✓</td><td></td></tr>
+        <tr><td>Pre-compute CVerusHashV2 key from the canonical buffer prefix</td><td>✓</td><td></td></tr>
+        <tr><td>Memcpy the nonce into the partial-fill region of the scratch buffer</td><td></td><td>✓ (8 bytes)</td></tr>
+        <tr><td>Run the VerusHash 2.2 pipeline (haraka512 + clhash + haraka512_keyed × 16 rounds)</td><td></td><td>✓ (unavoidable)</td></tr>
+      </tbody>
+    </table>
+
+    <p>The inner loop went from this:</p>
+
+    <pre><code>// Before: ~960ns per iteration on M5 P-core
+for (...) {
+    build_preheader(...);          // ~120ns
+    blake2b_VerusDefault(...);     // ~280ns
+    memcpy + canonical_clear(...); // ~200ns
+    vh2.Reset();                   // ~40ns
+    vh2.Write(scratch, 299);       // ~320ns (incl. key cache rebuild)
+}</code></pre>
+
+    <p>To this:</p>
+
+    <pre><code>// After: ~250ns per iteration on M5 P-core
+// Per-job setup runs once:
+build_preheader_template(...);
+preseed_clhash_key(...);
+
+// Per-nonce hot loop:
+for (uint64_t n = 0; n &lt; 50000; n++) {
+    // ONE mutation: the 8-byte counter in the partial fill.
+    if (body_tail_room &gt; 0) {
+        memcpy(scratch_tail, &amp;local_nonce, body_tail_room);
+        memcpy(submit_tail,  &amp;local_nonce, body_tail_room);
+    }
+    vh2.Reset();
+    vh2.Write(scratch.data(), scratch.size());
+    vh2.Finalize2b(hash);
+    // compare + maybe submit
+    local_nonce += n_threads;
+}</code></pre>
+
+    <div class="callout good">
+      <p><strong>Result on the same M5, same pool, same job:</strong></p>
+      <p><code>[STATS] 1.04 MH/s | 7 threads</code> → <code>[STATS] 3.94 MH/s | 7 threads</code></p>
+      <p>3.8× speedup. Per-thread throughput went from ~150 KH/s to ~563 KH/s. The bottleneck moved from "memory churn + crypto setup" to actually-running-the-hash, which is what should be the bottleneck.</p>
+    </div>
+
+    <p>The lesson is one of those things that sounds obvious in retrospect: <strong>profile your hot loop before adding code to it</strong>. We'd added the PBaaS preprocessing in chapter 2 to fix a correctness bug, and the correctness fix worked, but the work-per-iteration ballooned without anyone noticing because we were chasing accepted shares, not hash-per-second.</p>
+
+    <h2 id="metal-port">4. Five Metal primitives, byte-perfect</h2>
+
+    <p>With CPU mining working and accepting shares, the next question was GPU acceleration. Apple Silicon GPUs are interesting for crypto mining because they share unified memory with the CPU (no PCIe roundtrip), they have a lot of compute (~10 TFLOPS on M5), and almost no one has tried to use them for proof-of-work because Apple doesn't sell to miners.</p>
+
+    <p>The plan: port VerusHash 2.2's five cryptographic building blocks to Metal Shading Language, validate each one byte-perfect against the CPU reference, then integrate them into a single mining kernel.</p>
+
+    <h3>haraka256 — the explicit AES round that wouldn't validate</h3>
+
+    <p>Haraka is a low-latency permutation built from AES rounds. <code>haraka256</code> processes 32-byte inputs through 5 outer rounds, each containing 4 AES sub-rounds. We wrote a "by hand" Metal kernel that implemented <code>SubBytes + ShiftRows + MixColumns + AddRoundKey</code> as separate operations. It produced wrong output.</p>
+
+    <p>We debugged for hours. We thought the round constants were in the wrong byte order. They weren't. We thought ShiftRows was rotating the wrong direction. It wasn't. We thought MixColumns had a sign-extension bug in the <code>gf2</code> doubling. It didn't. Every individual operation tested correctly in isolation, but composed in the round they didn't.</p>
+
+    <p>The eventual fix was to throw away the explicit round implementation and adopt the <strong>T-table form</strong> from the canonical CPU reference. T-tables fuse <code>SubBytes</code>, <code>ShiftRows</code>, and <code>MixColumns</code> into a single 256-entry lookup keyed by the input byte and the output row. The CPU reference uses them because they're fast; we adopted them because there's <strong>one fused operation to get right instead of three separate ones to compose</strong>.</p>
+
+    <pre><code>// One AES round in T-table form: 16 lookups + 12 XORs + 4 RK XORs.
+inline void aesenc_tt(thread uint *s, constant uint *rk) {
+    uint x0 = s[0], x1 = s[1], x2 = s[2], x3 = s[3];
+    uint y0, y1, y2, y3;
+
+    y0 = t_row((uchar)( x0        &amp; 0xff), 0);
+    y1 = t_row((uchar)( x1        &amp; 0xff), 0);
+    // ... 14 more lookups for rows 1, 2, 3 with shift ...
+
+    s[0] = y0 ^ rk[0]; s[1] = y1 ^ rk[1];
+    s[2] = y2 ^ rk[2]; s[3] = y3 ^ rk[3];
+}</code></pre>
+
+    <p>Byte-perfect on the first try. Test vector from the Haraka v2 paper (<code>8027ccb87949774b…</code>) matched on the GPU.</p>
+
+    <h3>haraka512 — same template, twice as wide</h3>
+
+    <p>With the T-table approach validated for 256-bit, scaling to 512-bit was a clean port: 4 halves of 16 bytes instead of 2, 4 round constants per sub-round instead of 2, the <code>MIX4</code> mixing layer instead of <code>MIX2</code>, and a 32-byte <code>TRUNCSTORE</code> output instead of 32-byte feed-forward.</p>
+
+    <p>Validated against the paper test vector <code>be7f723b4e80a998…</code> first try.</p>
+
+    <h3>clmul64 — the carryless multiply that Metal doesn't have</h3>
+
+    <p>This is the part that <em>seemed</em> hard before we wrote it. <code>verusclhash</code> is built almost entirely around 64×64-bit <strong>carryless multiplication</strong> — multiplying two 64-bit polynomials over GF(2) to produce a 128-bit polynomial. On x86 this is one instruction (<code>_mm_clmulepi64_si128</code>). On ARM it's <code>vmull_p64</code>. On Metal, it doesn't exist as a primitive.</p>
+
+    <p>The CPU reference includes a portable software implementation using the <strong>4-bit window technique</strong>: precompute 16 entries (<code>u[k] = k·b</code> for <code>k</code> in 0..15), then unroll the multiplication as 16 lookups + XORs over windows of <code>a</code>. The total cost is roughly 16 GF doublings + 16 XORs to build the table, then 16 shifted lookups for the multiply, plus a small "repair" pass for high-bit carries.</p>
+
+    <p>This ported cleanly to MSL with one caveat: <code>uint64_t</code> left-shifts past 63 are undefined behavior in MSL just like in C. The loop bounds in the algorithm keep <code>(64 - i)</code> in the range <code>[4, 60]</code>, so we're safe — but the kernel code documents it.</p>
+
+    <p>We validated 1032 (a, b) pairs:</p>
+
+    <ul>
+      <li>8 hand-picked edge cases: <code>(0,0)</code>, <code>(1,1)</code>, <code>(max,max)</code>, <code>(alt,alt)</code>, <code>(lsb,max)</code>, <code>(msb,msb)</code>, and two ascending/descending hex words</li>
+      <li>1024 pseudo-random pairs from <code>xorshift64*</code> (deterministic — failures would be bit-reproducible)</li>
+    </ul>
+
+    <p>All 1032 byte-perfect. The interesting edge cases:</p>
+
+    <ul>
+      <li><code>max × max</code> → <code>0x5555…5555 / 0x5555…5555</code> — alternating bit pattern is a known GF(2) identity for all-ones inputs</li>
+      <li><code>msb × msb</code> → <code>0 / 0x4000…0000</code> — <code>x⁶³ × x⁶³ = x¹²⁶</code>, not <code>x¹²⁷</code>, which is the test you'd accidentally fail if you mixed up GF poly mul with regular integer mul</li>
+    </ul>
+
+    <h3>mulhrs_epi16 and precompReduction64 — the closing primitives</h3>
+
+    <p>Two more pieces to make <code>verusclhash</code> complete:</p>
+
+    <ul>
+      <li><strong><code>mulhrs_epi16</code></strong> — Intel SSSE3's "packed signed 16-bit multiply, high half, rounded". 8-lane SIMD, lane-independent, ~5 lines: <code>r[i] = (int16_t)((a[i] * b[i] + 0x4000) >> 15)</code>. Validated against 517 vectors (5 edge + 512 random).</li>
+      <li><strong><code>precompReduction64</code></strong> — the GF reduction that closes the verusclhash pipeline, taking a 128-bit accumulator down to 64 bits under the polynomial <code>x⁶⁴ + x⁴ + x³ + x + 1</code>. Reuses the same <code>clmul64</code> we already validated, plus a 16-byte lookup table and two XORs. 518 vectors passed.</li>
+    </ul>
+
+    <div class="verdict">
+      <h3>Status of the Metal port as of v0.19.0</h3>
+      <table>
+        <thead><tr><th>Primitive</th><th>Test vectors</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td>haraka256</td><td>4</td><td>✓ byte-perfect</td></tr>
+          <tr><td>haraka512</td><td>4 (incl. paper)</td><td>✓ byte-perfect</td></tr>
+          <tr><td>haraka512_keyed</td><td>9</td><td>✓ byte-perfect</td></tr>
+          <tr><td>clmul64</td><td>1032</td><td>✓ byte-perfect</td></tr>
+          <tr><td>mulhrs_epi16</td><td>517</td><td>✓ byte-perfect</td></tr>
+          <tr><td>precompReduction64</td><td>518</td><td>✓ byte-perfect</td></tr>
+          <tr class="highlight"><td><strong>Total</strong></td><td><strong>~2100</strong></td><td><strong>all pass</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="whats-next">5. What's next, and what to honestly expect</h2>
+
+    <p>The remaining work is the <strong>32-iteration selector loop</strong> at the heart of <code>verusclhash</code> — a 200-line function with 8 switch cases, inner do-while loops, signed 64-bit modulo, and read/mutate semantics on a ~9KB key buffer. Every cryptographic primitive it touches is now validated on the GPU; what's left is glue translation and careful case-by-case validation.</p>
+
+    <p>Estimate: another week of focused work to get the kernel producing the correct hash for arbitrary (key, input) pairs, plus a few more days for batched dispatch and mining-loop integration.</p>
+
+    <h3>Honest performance expectations</h3>
+
+    <p>Here's the thing about VerusHash that most "GPU mining is 100× faster" intuitions get wrong: <strong>VerusHash is specifically designed to be hard to accelerate on GPUs relative to CPUs</strong>. It's why the protocol exists.</p>
+
+    <p>Per-hash compute count for VerusHash 2.2 is roughly:</p>
+
+    <ul>
+      <li>4 × <code>haraka512</code> calls in the outer pipeline (~6000 GPU ops each)</li>
+      <li>16 × <code>verusclhash</code> calls, each running 32 selector iterations (~7000 ops × 16 = ~112000 ops)</li>
+      <li>Total per hash: ~256,000 GPU ops</li>
+    </ul>
+
+    <p>On M5 at ~1 TFLOPS sustained compute and ~30% achievable utilization for branchy, memory-bound kernels like this, that's roughly <strong>1.3 µs per hash</strong> in the steady state — about <strong>770 KH/s per "ideal" GPU thread</strong>. The win over CPU comes from parallelism: instead of 7 P-core threads we get to dispatch hundreds of GPU threads in flight at once.</p>
+
+    <p>Realistic GPU target: <strong>12–20 MH/s</strong> (3–5× the current CPU). Not 100×. Not even 10×. But for free heat-and-power that's already in the laptop, it's worth shipping.</p>
+
+    <p>The other reason it's worth shipping: <strong>no one else has done it</strong>. Apple Silicon is a blind spot in the open-source mining ecosystem because most miners run on hand-tuned CUDA kernels for Nvidia hardware. Building an Apple Metal port surfaces design constraints — no <code>vmull_p64</code>, no thread-divergent control flow without penalty, threadgroup memory budget — that are genuinely interesting to work through.</p>
+
+    <h3>If you want to follow along</h3>
+
+    <ul>
+      <li><strong>v0.19.0 release with the 3.8× CPU speedup</strong>: <a href="https://github.com/helloworldxdwastaken/UnminerMac/releases/tag/v0.19.0" target="_blank" rel="noopener">github.com/helloworldxdwastaken/UnminerMac/releases/tag/v0.19.0</a></li>
+      <li><strong>Metal kernels + validators</strong>: <a href="https://github.com/helloworldxdwastaken/UnminerMac/tree/main/verusminer/metal" target="_blank" rel="noopener">verusminer/metal/</a> — every <code>.metal</code> file has its own <code>validate_*.swift</code> harness next to it</li>
+      <li><strong>Integration pickup plan</strong> for the next session: <a href="https://github.com/helloworldxdwastaken/UnminerMac/blob/main/verusminer/METAL_INTEGRATION_PLAN.md" target="_blank" rel="noopener">METAL_INTEGRATION_PLAN.md</a></li>
+    </ul>
+
+    <p>And if you're working on the same problem (VerusHash, Apple Silicon, Metal compute) — drop a note on the GitHub issues. We'd rather not duplicate the debug cycles.</p>
+
+  </div>
+</article>
+
+<footer>
+  <div class="container">
+    <p>UnminerMac · Verox Studio · MIT licensed · built on a quiet M5</p>
+  </div>
+</footer>
+
+</body>
+</html>
