@@ -720,63 +720,64 @@ static void worker_loop(int thread_id, int n_threads, MinerShared *shared) {
                               notify_sol, en1_bytes, 0);
             body_off = soln_off + p.slice_bytes;
 
+            // PER-JOB blake2b: compute ONCE, embed in hash_buf at
+            // solution[124..156]. Pool's preHeader depends on header
+            // (which is constant per job since we don't mutate nonce)
+            // and solution[8..72] (also constant, taken from notify).
+            // So blake2b is constant per job — recompute would be
+            // wasted work per iteration.
+            pbaas_embed_blake2b(hash_buf.data(), hash_buf.size());
+
             local_nonce = (uint64_t)thread_id;
         }
 
-        // IMPORTANT: do NOT mutate the header nNonce. The pool's PBaaS
-        // canonicalize builds a preHeader that INCLUDES the nNonce bytes,
-        // computes blake2b("VerusDefaultHash" personalized) over it, and
-        // requires that blake2b to equal `solution[124..156]` — which was
-        // pre-computed by the daemon over its own (constant) nNonce. If we
-        // mutate header nNonce per iteration, blake2b mismatches and
-        // verushash-node returns 0xff..ff → pool rejects as "low difficulty".
-        // Per verus_hash.cpp comment: "nNonce (if nonce changes must update
-        // preHeaderHash in solution)". We keep nNonce = extranonce1 ||
-        // zeros and find hash diversity by mutating the soln tail.
+        // PERF-CRITICAL: we want CVerusHashV2's internal CL hash key
+        // cache to HIT across iterations. The cache key is the curBuf
+        // state at end of Write — which is determined by every input
+        // byte except the final 32-byte partial-fill chunk. So we
+        // mutate ONLY bytes in that final chunk per iteration. That
+        // means:
+        //   - Header nNonce: FROZEN to zeros (pool throws it away
+        //     anyway — see jobManager.js line 281)
+        //   - blake2b(preHeader): computed ONCE per job (done above)
+        //     and embedded in hash_buf — preHeader is constant since
+        //     nonce + solution[8..72] are constant
+        //   - Pre-clear: applied ONCE per job to a scratch copy
+        //   - Per-iteration: only mutate the 8-byte counter in the
+        //     soln tail (which is in the partial fill region, past
+        //     the Write chain → doesn't perturb the seed)
+        //
+        // Net result: ~3 µs of per-iter blake2b + 1487-byte memcpy +
+        // CL key regen collapses to a memcpy(8 bytes) per iteration.
+        // Expected speedup: 5-10× over the per-iter-everything path.
         const EhParams &p = EH_VARIANTS[current_variant];
         int en1n = (int)std::min((size_t)15, en1_bytes.size());
-        uint8_t *body_tail_ptr = hash_buf.data() + body_off + (p.body_bytes - 15) + en1n;
+        // soln tail counter offset (within hash_buf, body_tail_room
+        // bytes wide). Mutated each iteration.
+        size_t tail_off_in_buf = body_off + (p.body_bytes - 15) + en1n;
         int body_tail_room = std::max(0,
             std::min(8, p.body_bytes - (p.body_bytes - 15 + en1n)));
 
-        // (Per-worker scratch state is now owned by the CVerusHashV2
-        // instance below — its constructor + thread_local
-        // verusclhasher_key handle key buffer allocation internally.)
+        // Build scratch ONCE per job — mirrors what pool gets after
+        // its post-blake2b-match canonical clear. We hash this; pool
+        // hashes its own equivalent — same bytes → same hash.
+        thread_local std::vector<uint8_t> scratch;
+        scratch.assign(hash_buf.begin(), hash_buf.end());
+        pbaas_apply_clear(scratch.data(), scratch.size());
 
-        // Hash via canonical CVerusHashV2 (Reset/Write/Finalize2b). This is
-        // the EXACT code path hellcatz/verushash-node's vh.hash2b2 takes —
-        // so whatever bytes we hash, pool computes the same hash. One
-        // CVerusHashV2 instance per worker (its scratch buffers are not
-        // thread-safe).
         thread_local CVerusHashV2 vh2(SOLUTION_VERUSHHASH_V2_2);
 
-        // Per-iteration mutation: last 8 bytes of header nonce slot.
-        // Pool's processShare reads our submitted params[3] (28 bytes) and
-        // prepends en1 → 32 bytes of nonce. After we update the nonce, we
-        // recompute blake2b(preHeader) and embed it in solution[124..156]
-        // so the pool's blake2b match succeeds and pool clears + hashes
-        // the canonical buffer (which we mirror locally before hashing).
-        uint8_t *hdr_iter_ptr = hash_buf.data() + NONCE_OFFSET + (NONCE_FIELD - 8);
-
-        // Scratch buffer for the cleared version we actually hash —
-        // allocated once per outer loop iteration to avoid per-hash
-        // malloc cost.
-        std::vector<uint8_t> scratch(hash_buf.size());
+        uint8_t *scratch_tail = scratch.data() + tail_off_in_buf;
+        uint8_t *submit_tail  = hash_buf.data() + tail_off_in_buf;
 
         for (int n = 0; n < 50000 && !shared->stop.load(std::memory_order_relaxed); n++) {
-            // 1. Mutate nonce (drives hash diversity)
-            memcpy(hdr_iter_ptr, &local_nonce, 8);
-
-            // 2. Recompute blake2b(preHeader) and embed at solution[124..156].
-            //    This is what makes pool's PBaaS match succeed — without
-            //    this, pool's vh.hash2b2 returns 0xff..ff and the share is
-            //    rejected as "low difficulty share" no matter what we hash.
-            pbaas_embed_blake2b(hash_buf.data(), hash_buf.size());
-
-            // 3. Copy + clear (mirror what pool's vh.hash2b2 does
-            //    internally after the blake2b match passes).
-            memcpy(scratch.data(), hash_buf.data(), hash_buf.size());
-            pbaas_apply_clear(scratch.data(), scratch.size());
+            // ONE mutation: the 8-byte counter in the partial fill.
+            // Updated in BOTH the hash input (scratch) AND the submit
+            // template (hash_buf) so they stay in sync.
+            if (body_tail_room > 0) {
+                memcpy(scratch_tail, &local_nonce, body_tail_room);
+                memcpy(submit_tail,  &local_nonce, body_tail_room);
+            }
 
             uint8_t hash[32];
             vh2.Reset();
