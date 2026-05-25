@@ -86,7 +86,9 @@ int gpu_mine_init(const char *kernel_metal_path, uint32_t batch_size) {
 
         // Allocate persistent buffers
         g_batch_size = batch_size;
-        g_input_buf  = [g_device newBufferWithLength:512
+        // Verus scratch is ~1487 bytes worst case (140 header + 1347 max-soln).
+        // Allocate 2048 for headroom.
+        g_input_buf  = [g_device newBufferWithLength:2048
                                             options:MTLResourceStorageModeShared];
         g_key_buf    = [g_device newBufferWithLength:(NSUInteger)batch_size * MINE_KEY_SCRATCH_PER_THREAD
                                             options:MTLResourceStorageModeShared];
@@ -125,8 +127,8 @@ int gpu_mine_dispatch(
         fprintf(stderr, "[gpu] not initialized\n");
         return -1;
     }
-    if (input_len > 512) {
-        fprintf(stderr, "[gpu] input too large: %u (max 512)\n", input_len);
+    if (input_len > 2048) {
+        fprintf(stderr, "[gpu] input too large: %u (max 2048)\n", input_len);
         return -1;
     }
 

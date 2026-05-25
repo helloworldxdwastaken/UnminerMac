@@ -841,6 +841,18 @@ inline bool hash_below_target_gpu(thread const uchar *hash, device const uchar *
     return false;
 }
 
+// Read byte idx from the shared input_template, substituting nonce bytes
+// at body_tail_off..body_tail_off+8. Avoids per-thread scratch copy.
+inline uchar mine_byte_at(uint idx,
+                          device const uchar *input_template,
+                          uint body_tail_off,
+                          uint64_t nonce) {
+    if (idx >= body_tail_off && idx < body_tail_off + 8) {
+        return (uchar)((nonce >> ((idx - body_tail_off) * 8)) & 0xff);
+    }
+    return input_template[idx];
+}
+
 kernel void verus_mine_kernel(
     device const uchar    *input_template [[buffer(0)]],
     device uchar          *key_scratch    [[buffer(1)]],
@@ -858,20 +870,6 @@ kernel void verus_mine_kernel(
     // Per-thread nonce: base_nonce + gid
     uint64_t nonce = base_nonce + (uint64_t)gid;
 
-    // Per-thread mutable copy of the input. Cap at 512 bytes (Verus pre-clear
-    // buffer is ~300; this leaves headroom). Hardcoded size since MSL doesn't
-    // allow dynamic-sized thread arrays.
-    thread uchar scratch[512];
-    if (input_len > 512) return;
-    for (uint i = 0; i < input_len; i++) scratch[i] = input_template[i];
-
-    // Embed the 8-byte nonce at body_tail_off, overwriting the template bytes
-    // there (the template had base_nonce's bytes; we replace with this thread's
-    // nonce). The miner takes care that body_tail_off..+8 is the right slot.
-    for (int b = 0; b < 8; b++) {
-        scratch[body_tail_off + b] = (uchar)((nonce >> (8 * b)) & 0xff);
-    }
-
     // Per-thread key buffer slice in device memory
     device uchar *key = key_scratch + gid * MINE_KEY_SCRATCH_PER_THREAD;
 
@@ -881,14 +879,16 @@ kernel void verus_mine_kernel(
     for (int i = 0; i < 64; i++) curBuf[i] = 0;
     int curPos = 0;
 
-    // Write loop
+    // Write loop — reads directly from shared input_template, substituting
+    // the nonce bytes at body_tail_off on the fly (no per-thread copy).
     uint pos = 0;
     while (pos < input_len) {
         int room = 32 - curPos;
         int remaining = (int)(input_len - pos);
         if (remaining >= room) {
             for (int i = 0; i < room; i++) {
-                curBuf[32 + curPos + i] = scratch[pos + i];
+                curBuf[32 + curPos + i] = mine_byte_at(pos + i, input_template,
+                                                       body_tail_off, nonce);
             }
             haraka512_apply(result, curBuf);
             for (int i = 0; i < 32; i++) curBuf[i] = result[i];
@@ -896,7 +896,8 @@ kernel void verus_mine_kernel(
             curPos = 0;
         } else {
             for (int i = 0; i < remaining; i++) {
-                curBuf[32 + curPos + i] = scratch[pos + i];
+                curBuf[32 + curPos + i] = mine_byte_at(pos + i, input_template,
+                                                       body_tail_off, nonce);
             }
             curPos += remaining;
             pos = input_len;
