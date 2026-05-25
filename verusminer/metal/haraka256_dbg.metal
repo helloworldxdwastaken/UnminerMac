@@ -1,6 +1,17 @@
-// haraka256.metal — Haraka256 v2 kernel (S-box based AES)
-// Explicit SubBytes + ShiftRows + MixColumns per round.
-// Slower than T-table but correct by construction.
+// haraka256_dbg.metal — instrumented variant of haraka256_kernel that
+// dumps the 32-byte state AFTER each of the 5 rounds, so we can pinpoint
+// the first round where GPU output diverges from the CPU reference.
+//
+// Output layout (8 uint32 per row, 32 bytes):
+//   row 0 = input
+//   row 1 = state after round 0 (AES2 + MIX2)
+//   row 2 = state after round 1
+//   row 3 = state after round 2
+//   row 4 = state after round 3
+//   row 5 = state after round 4
+//   row 6 = final (after XOR with input + TRUNCSTORE)
+// Total: 7 rows * 32 bytes = 224 bytes per input
+
 #include <metal_stdlib>
 using namespace metal;
 
@@ -23,7 +34,6 @@ constant uchar SBOX[256] = {
     0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
 };
 
-// Haraka v2 round constants — word-reversed for MSL
 constant uint RC[40 * 4] = {
     0x75817b9d,0xb2c5fef0,0xe620c00a,0x0684704c,0x2f08f717,0x640f6ba4,0x88f3a06b,0x8b66b4e1,
     0x9f029114,0xcf029d60,0x53f28498,0x3402de2d,0xfd5b4f79,0xbbf3bcaf,0x2e7b4f08,0x0ed6eae6,
@@ -47,65 +57,26 @@ constant uint RC[40 * 4] = {
     0x76aed83b,0x2bbec122,0x2e7a7f7e,0x0bfd133d,0x12e0b60a,0xe7f53e0b,0x6f4a3cc6,0x1daeb0b6
 };
 
-// MixColumns on ONE 128-bit state (4 uint32 columns).
-// Operates on each column independently, mixing its 4 row bytes.
-//
-// BUG-FIX: MSL `uchar << 1` truncates to uchar (8 bits), so 0x80 << 1
-// becomes 0x00 instead of 0x100 — breaking the GF(2^8) doubling for any
-// byte with bit 7 set. C int-promotes uchar to int before shift, MSL
-// doesn't. Cast to int first to recover the full result, then test bit 7
-// (via uchar mask) and conditionally XOR 0x1b for the GF reduction.
 inline void mixcolumns(thread uint *s) {
     #define X2(x) ((uchar)((((int)(x)) << 1) ^ (((uchar)(x) & 0x80) ? 0x1b : 0)))
     #define X3(x) ((uchar)(X2(x) ^ (uchar)(x)))
-
-    // Extract bytes: each uint32 = column, bytes within = rows 0..3
     uchar a0=s[0]&0xff, a1=(s[0]>>8)&0xff, a2=(s[0]>>16)&0xff, a3=s[0]>>24;
     uchar b0=s[1]&0xff, b1=(s[1]>>8)&0xff, b2=(s[1]>>16)&0xff, b3=s[1]>>24;
     uchar c0=s[2]&0xff, c1=(s[2]>>8)&0xff, c2=(s[2]>>16)&0xff, c3=s[2]>>24;
     uchar d0=s[3]&0xff, d1=(s[3]>>8)&0xff, d2=(s[3]>>16)&0xff, d3=s[3]>>24;
-
-    // Column 0: [a0,a1,a2,a3] → apply MixColumns matrix
     s[0] = (X2(a0)^X3(a1)^a2^a3)       | ((X2(a1)^X3(a2)^a3^a0)<<8) |
            ((X2(a2)^X3(a3)^a0^a1)<<16)  | ((X2(a3)^X3(a0)^a1^a2)<<24);
-
-    // Column 1: [b0,b1,b2,b3]
     s[1] = (X2(b0)^X3(b1)^b2^b3)       | ((X2(b1)^X3(b2)^b3^b0)<<8) |
            ((X2(b2)^X3(b3)^b0^b1)<<16)  | ((X2(b3)^X3(b0)^b1^b2)<<24);
-
-    // Column 2: [c0,c1,c2,c3]
     s[2] = (X2(c0)^X3(c1)^c2^c3)       | ((X2(c1)^X3(c2)^c3^c0)<<8) |
            ((X2(c2)^X3(c3)^c0^c1)<<16)  | ((X2(c3)^X3(c0)^c1^c2)<<24);
-
-    // Column 3: [d0,d1,d2,d3]
     s[3] = (X2(d0)^X3(d1)^d2^d3)       | ((X2(d1)^X3(d2)^d3^d0)<<8) |
            ((X2(d2)^X3(d3)^d0^d1)<<16)  | ((X2(d3)^X3(d0)^d1^d2)<<24);
-
     #undef X2
     #undef X3
 }
 
-// Emulates _mm_aesenc_si128(s, rk):
-// SubBytes(ShiftRows(s)) → MixColumns → XOR round key
-// NOTE: AddRoundKey happens at the END, not the beginning!
-// Reverse the byte order within a uint32 — needed because the RC table
-// in this file was authored with FULLY BYTE-REVERSED round keys (16-byte
-// keys laid out backwards), so when used as a uint32[4] array indexed
-// rk[0..3], each element is the bswap of the canonical haraka_rc bytes
-// AND the rk array itself is in reverse uint32 order. We undo both at
-// AddRoundKey time so the table doesn't need to be rewritten.
-inline uint bswap32(uint x) {
-    return ((x >> 24) & 0x000000ff) | ((x >>  8) & 0x0000ff00) |
-           ((x <<  8) & 0x00ff0000) | ((x << 24) & 0xff000000);
-}
-
 inline void aesenc_emu(thread uint *s, constant uint *rk) {
-
-    // SubBytes + ShiftRows
-    // State is column-major: s[0]=col0, s[1]=col1, s[2]=col2, s[3]=col3
-    // ShiftRows: row i rotates LEFT by i (col j takes its row-i byte
-    // from col (j+i) mod 4).
-
     uchar c0_0 = SBOX[s[0] & 0xff];        uchar c0_1 = SBOX[(s[1] >> 8) & 0xff];
     uchar c0_2 = SBOX[(s[2] >> 16) & 0xff]; uchar c0_3 = SBOX[s[3] >> 24];
     uchar c1_0 = SBOX[s[1] & 0xff];        uchar c1_1 = SBOX[(s[2] >> 8) & 0xff];
@@ -114,77 +85,63 @@ inline void aesenc_emu(thread uint *s, constant uint *rk) {
     uchar c2_2 = SBOX[(s[0] >> 16) & 0xff]; uchar c2_3 = SBOX[s[1] >> 24];
     uchar c3_0 = SBOX[s[3] & 0xff];        uchar c3_1 = SBOX[(s[0] >> 8) & 0xff];
     uchar c3_2 = SBOX[(s[1] >> 16) & 0xff]; uchar c3_3 = SBOX[s[2] >> 24];
-
     s[0] = c0_0 | ((uint)c0_1 << 8) | ((uint)c0_2 << 16) | ((uint)c0_3 << 24);
     s[1] = c1_0 | ((uint)c1_1 << 8) | ((uint)c1_2 << 16) | ((uint)c1_3 << 24);
     s[2] = c2_0 | ((uint)c2_1 << 8) | ((uint)c2_2 << 16) | ((uint)c2_3 << 24);
     s[3] = c3_0 | ((uint)c3_1 << 8) | ((uint)c3_2 << 16) | ((uint)c3_3 << 24);
-
-    // MixColumns (operates on each column independently)
     mixcolumns(s);
-
-    // AddRoundKey. The RC table here was authored "word-reversed for
-    // MSL" by a previous iteration of this kernel, but neither
-    // straight rk[i], bswap32(rk[i]), nor reversed-index variants
-    // produce CPU-matching output on the canonical Haraka v2 test
-    // vector. Reverting to natural index order pending a kernel-wide
-    // rewrite that matches haraka_portable.c's byte-level state layout
-    // line-by-line (the current uint32-packed code has compounding
-    // layout drift between SubBytes/ShiftRows + MixColumns + MIX2).
-    // See verusminer/metal/STATUS.md "What to try next" — step 1.
     s[0] ^= rk[0]; s[1] ^= rk[1]; s[2] ^= rk[2]; s[3] ^= rk[3];
 }
 
-// Load 32 bytes LE → 8 uint32
 inline void ld32(const device uchar *src, thread uint *w) {
     for(int i=0;i<8;i++){uint o=i*4;w[i]=(uint)src[o]|((uint)src[o+1]<<8)|((uint)src[o+2]<<16)|((uint)src[o+3]<<24);}
 }
-inline void st32(device uchar *dst, const thread uint *w) {
-    for(int i=0;i<8;i++){uint o=i*4;dst[o]=w[i]&0xff;dst[o+1]=(w[i]>>8)&0xff;dst[o+2]=(w[i]>>16)&0xff;dst[o+3]=(w[i]>>24)&0xff;}
+inline void st_state(device uchar *dst, const thread uint *s0, const thread uint *s1) {
+    for(int i=0;i<4;i++){ uint o=i*4;
+        dst[o]=s0[i]&0xff; dst[o+1]=(s0[i]>>8)&0xff; dst[o+2]=(s0[i]>>16)&0xff; dst[o+3]=(s0[i]>>24)&0xff;
+    }
+    for(int i=0;i<4;i++){ uint o=16+i*4;
+        dst[o]=s1[i]&0xff; dst[o+1]=(s1[i]>>8)&0xff; dst[o+2]=(s1[i]>>16)&0xff; dst[o+3]=(s1[i]>>24)&0xff;
+    }
 }
 
-kernel void haraka256_kernel(
+// Instrumented kernel — writes round-by-round state to dump buffer.
+// Per-input dump size: 7 rows * 32 bytes = 224 bytes.
+kernel void haraka256_dbg_kernel(
     device const uchar *inputs  [[buffer(0)]],
-    device uchar       *outputs [[buffer(1)]],
-    device atomic_uint *count   [[buffer(2)]],
+    device uchar       *dump    [[buffer(1)]],
     uint gid [[thread_position_in_grid]])
 {
-    uint base = gid * 32;
+    uint in_off  = gid * 32;
+    uint out_off = gid * 224;
+
+    // Row 0: input
+    for (int i=0;i<32;i++) dump[out_off + i] = inputs[in_off + i];
+
     uint w[8];
-    ld32(inputs + base, w);
+    ld32(inputs + in_off, w);
     uint s0[4] = {w[0],w[1],w[2],w[3]};
     uint s1[4] = {w[4],w[5],w[6],w[7]};
 
     for(uint r=0; r<5; r++) {
         uint off = r * 8;
-        // AES2(s0, s1, off): interleaved 2 rounds each
-        aesenc_emu(s0, RC + (off) * 4);
-        aesenc_emu(s1, RC + (off+1) * 4);
-        aesenc_emu(s0, RC + (off+2) * 4);
-        aesenc_emu(s1, RC + (off+3) * 4);
-
-        // MIX2 — interleave the two halves byte-wise (matches
-        // _mm_unpacklo_epi32 / _mm_unpackhi_epi32):
-        //   new s0 = (a0, b0, a1, b1)   ← low 32-bit lanes interleaved
-        //   new s1 = (a2, b2, a3, b3)   ← high 32-bit lanes interleaved
+        aesenc_emu(s0, RC + (off    ) * 4);
+        aesenc_emu(s1, RC + (off + 1) * 4);
+        aesenc_emu(s0, RC + (off + 2) * 4);
+        aesenc_emu(s1, RC + (off + 3) * 4);
         uint a0=s0[0],a1=s0[1],a2=s0[2],a3=s0[3];
         uint b0=s1[0],b1=s1[1],b2=s1[2],b3=s1[3];
         s0[0]=a0;s0[1]=b0;s0[2]=a1;s0[3]=b1;
         s1[0]=a2;s1[1]=b2;s1[2]=a3;s1[3]=b3;
+
+        // Dump state after round r
+        st_state(dump + out_off + (1 + r) * 32, s0, s1);
     }
 
-    // Feed-forward XOR with the original 32-byte input — this is the
-    // step the previous kernel was missing entirely. haraka256 ≠ haraka512:
-    // haraka256 outputs the FULL 32-byte state XORed with input (no
-    // truncation), while haraka512 outputs 32 bytes of a 64-byte state
-    // after a TRUNCSTORE step. Earlier version was doing the haraka512
-    // truncstore reordering on a haraka256 state, hence the garbage.
-    s0[0] ^= w[0]; s0[1] ^= w[1]; s0[2] ^= w[2]; s0[3] ^= w[3];
-    s1[0] ^= w[4]; s1[1] ^= w[5]; s1[2] ^= w[6]; s1[3] ^= w[7];
-
-    // Output state in natural order: s0[0..16] then s1[16..32]
-    uint final[8] = { s0[0], s0[1], s0[2], s0[3],
-                      s1[0], s1[1], s1[2], s1[3] };
-    st32(outputs + base, final);
-    atomic_fetch_add_explicit(count, 1, memory_order_relaxed);
+    // Row 6: final after XOR with input (full 32-byte state)
+    uint xinput[8];
+    ld32(inputs + in_off, xinput);
+    s0[0] ^= xinput[0]; s0[1] ^= xinput[1]; s0[2] ^= xinput[2]; s0[3] ^= xinput[3];
+    s1[0] ^= xinput[4]; s1[1] ^= xinput[5]; s1[2] ^= xinput[6]; s1[3] ^= xinput[7];
+    st_state(dump + out_off + 6 * 32, s0, s1);
 }
