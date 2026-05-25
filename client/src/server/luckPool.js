@@ -69,15 +69,41 @@ export async function fetchSettings(address) {
   return fetchJsonSafe(`${POOL_BASE}/settings/${address}`)
 }
 
+// Pool-wide stats — includes `marketStats.price_usd` and network info.
+// Shape (from live observation):
+//   { poolStats: { hashrate, minerCount, ... },
+//     networkStats: { height, ... },
+//     marketStats: { price_usd, price_btc, percent_change_24h, ... } }
+let _poolStatsCache = { at: 0, data: null }
+export async function fetchPoolStats({ maxAgeMs = 60_000 } = {}) {
+  const now = Date.now()
+  if (_poolStatsCache.data && now - _poolStatsCache.at < maxAgeMs) {
+    return _poolStatsCache.data
+  }
+  const data = await fetchJsonSafe(`${POOL_BASE}/stats`)
+  if (data) _poolStatsCache = { at: now, data }
+  return data
+}
+
+// Just the USD price (cached separately for hot-paths). Falls back to a
+// recent observation if the pool stats endpoint is unreachable.
+const VRSC_USD_FALLBACK = 0.93
+export async function fetchVrscPriceUSD() {
+  const stats = await fetchPoolStats()
+  const p = stats?.marketStats?.price_usd
+  return (typeof p === 'number' && p > 0) ? p : VRSC_USD_FALLBACK
+}
+
 // Single-shot combined fetch — pulls everything in parallel and returns a
 // flat object the UI can spread into state. Missing endpoints are silently
 // dropped (set to undefined) so the UI just won't render those fields.
 export async function fetchLuckPoolLive(address) {
   if (!address) return null
-  const [earningStats, miner, settings] = await Promise.all([
+  const [earningStats, miner, settings, priceUSD] = await Promise.all([
     fetchEarningStats(address),
     fetchMiner(address),
     fetchSettings(address),
+    fetchVrscPriceUSD(),
   ])
   const minerOk = miner && !miner.error
   return {
@@ -92,6 +118,10 @@ export async function fetchLuckPoolLive(address) {
     // Account config
     minPayment: settings?.minPayment ?? 0.0001,
     minerIP: settings?.minerIP ?? null,
+    // Live VRSC price in USD, pulled from LuckPool /verus/stats every
+    // ~60s. Drives the "$X.XX/day" estimates on the mining page so we
+    // don't ship a stale hardcoded value.
+    priceUSD: priceUSD,
     // Timestamp for cache busting in the UI
     fetchedAt: Date.now(),
   }

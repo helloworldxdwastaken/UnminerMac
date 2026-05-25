@@ -173,76 +173,76 @@
     </div>
 
     <!-- Earnings + payout chips -->
-    {#if isVerus}
-      {#if !poolLive || !poolLive.minerKnown}
-        <!-- Pre-acceptance banner: shown while pool hasn't seen this address
-             yet (first share takes a few minutes to land). Disappears once
-             /verus/miner/<addr> returns a real miner object. -->
-        <div
-          class="card-accent"
-          style="border:1px solid rgba(245,194,66,.4);background:rgba(245,194,66,.08);
-                 border-radius:10px;padding:10px 12px;margin-bottom:12px;font-size:12px;line-height:1.45">
-          <strong style="color:var(--gold)">⏳ Waiting for first accepted share…</strong>
-          <span class="text-dim">
-            Miner is hashing at the reported speed. LuckPool will register
-            this address after the first share is accepted (a few minutes at
-            this hashrate). Until then, numbers below are projections.
-            Verify live on
-            <button
-              type="button"
-              class="btn btn-ghost"
-              style="padding:0;display:inline;color:var(--accent);font-size:inherit"
-              on:click={openExplorer}>Pool dashboard ↗</button>.
-          </span>
-        </div>
-      {/if}
-    {/if}
-
     <div class="info-grid">
       {#if isVerus}
-        <!-- LIVE pool earnings, when available -->
+        <!-- LIVE pool earnings, when available. Price comes from LuckPool's
+             /verus/stats endpoint, refreshed every ~60s. -->
         {#if poolLive && (poolLive.vrscLast24h > 0 || poolLive.minerKnown)}
           <div class="info-chip">
             <div class="chip-label">Mined · last 24h <span style="color:var(--green)">● live</span></div>
             <div class="chip-value mono">
               {poolLive.vrscLast24h.toFixed(6)} VRSC
+              {#if poolLive.priceUSD}
+                <span style="color:var(--ink-dim);font-weight:400">
+                  ≈ ${(poolLive.vrscLast24h * poolLive.priceUSD).toFixed(3)}
+                </span>
+              {/if}
             </div>
           </div>
           <div class="info-chip">
             <div class="chip-label">Mined · last 7d</div>
             <div class="chip-value mono">
               {poolLive.vrscLast7d.toFixed(6)} VRSC
+              {#if poolLive.priceUSD}
+                <span style="color:var(--ink-dim);font-weight:400">
+                  ≈ ${(poolLive.vrscLast7d * poolLive.priceUSD).toFixed(3)}
+                </span>
+              {/if}
             </div>
           </div>
           {#if poolLive.miner?.balance !== undefined}
             <div class="info-chip" style="grid-column:1/-1">
               <div class="chip-label">Pending balance (auto-paid at {poolLive.minPayment} VRSC)</div>
-              <div class="chip-value mono">{Number(poolLive.miner.balance).toFixed(8)} VRSC</div>
+              <div class="chip-value mono">
+                {Number(poolLive.miner.balance).toFixed(8)} VRSC
+                {#if poolLive.priceUSD}
+                  <span style="color:var(--ink-dim);font-weight:400">
+                    ≈ ${(Number(poolLive.miner.balance) * poolLive.priceUSD).toFixed(4)}
+                  </span>
+                {/if}
+              </div>
             </div>
           {/if}
           {#if poolLive.miner?.paid !== undefined}
             <div class="info-chip" style="grid-column:1/-1">
               <div class="chip-label">Total paid out</div>
-              <div class="chip-value mono">{Number(poolLive.miner.paid).toFixed(8)} VRSC</div>
+              <div class="chip-value mono">
+                {Number(poolLive.miner.paid).toFixed(8)} VRSC
+                {#if poolLive.priceUSD}
+                  <span style="color:var(--ink-dim);font-weight:400">
+                    ≈ ${(Number(poolLive.miner.paid) * poolLive.priceUSD).toFixed(2)}
+                  </span>
+                {/if}
+              </div>
             </div>
           {/if}
         {/if}
 
-        <!-- Projection from CPU hashrate (always shown — gives expectation) -->
+        <!-- Estimate from current hashrate (uses live VRSC price) -->
         {#if liveStats.vrscPerDay !== undefined}
           <div class="info-chip">
-            <div class="chip-label">Projected / day · from {liveStats.threads || '?'} threads</div>
+            <div class="chip-label">Estimated / day · {liveStats.threads || '?'} threads</div>
             <div class="chip-value mono">
               {liveStats.vrscPerDay.toFixed(4)} VRSC
               <span style="color:var(--green);font-weight:400">
-                ≈ ${liveStats.usdPerDay?.toFixed(3) || '0.000'}
+                ≈ ${((poolLive?.priceUSD || 0.93) * liveStats.vrscPerDay).toFixed(3)}
               </span>
             </div>
           </div>
         {/if}
         {#if liveStats.sessionVrsc !== undefined && !poolLive?.minerKnown}
           <div class="info-chip">
-            <div class="chip-label">Session hashed (projected)</div>
+            <div class="chip-label">Session estimate</div>
             <div class="chip-value mono">
               {liveStats.sessionVrsc.toFixed(6)} VRSC
             </div>
